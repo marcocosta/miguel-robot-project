@@ -33,6 +33,7 @@ if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
 import robot_cloud_brain_v6_threaded as v6
+import robot_timer
 
 from v7.camera_manager import CameraManager
 from v7.camera_intents import classify_camera_intent, is_scene_camera_request, is_identity_camera_request
@@ -367,6 +368,9 @@ def handle_v7_local_utility(user_text: str) -> bool:
     """
     t = str(user_text or "").lower().strip()
 
+    if handle_local_timer_command(user_text):
+        return True
+
     if "what time" in t or "time is it" in t or "current time" in t:
         from datetime import datetime
         now = datetime.now().strftime("%I:%M %p").lstrip("0")
@@ -374,6 +378,59 @@ def handle_v7_local_utility(user_text: str) -> bool:
         return True
 
     return False
+
+
+def handle_local_timer_command(user_text: str) -> bool:
+    command = robot_timer.parse_timer_command(user_text)
+    if not command:
+        return False
+
+    intent = command.get("intent")
+    if intent == "start_timer":
+        seconds = int(command.get("seconds", 0) or 0)
+        result = robot_timer.start_timer(seconds)
+        v6.speak(f"Timer set for {_format_timer_duration(result['seconds'])}.")
+        return True
+
+    if intent == "cancel_timer":
+        robot_timer.cancel_timer()
+        v6.speak("Timer canceled.")
+        return True
+
+    if intent == "timer_status":
+        status = robot_timer.get_timer_status()
+        if not status.get("active"):
+            v6.speak("No timer is running.")
+            return True
+        v6.speak(f"There are about {_format_timer_remaining(status['remaining_seconds'])} left.")
+        return True
+
+    return False
+
+
+def _format_timer_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    if seconds and seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes} minute" + ("" if minutes == 1 else "s")
+    return f"{seconds} second" + ("" if seconds == 1 else "s")
+
+
+def _format_timer_remaining(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    minutes, remainder = divmod(seconds, 60)
+    if minutes:
+        return f"{minutes} minute{'s' if minutes != 1 else ''} and {remainder} second{'s' if remainder != 1 else ''}"
+    return f"{remainder} second" + ("" if remainder == 1 else "s")
+
+
+def check_local_timer_tick() -> None:
+    expired = robot_timer.timer_tick()
+    if not expired:
+        return
+    print("[V7 FULL TIMER] expired")
+    face_happy("Time is up")
+    v6.speak("Time is up.")
 
 
 def route_camera_intent_now(user_text: str, camera_intent: str, camera_manager: CameraManager) -> bool:
@@ -569,6 +626,7 @@ def run_v7_full():
             last_known_person = None
 
             while not stop_event.is_set():
+                check_local_timer_tick()
                 face_state = camera_manager.get_face_state(max_age_seconds=2.0)
                 recognized = face_state.get("recognized_person")
 
@@ -584,10 +642,12 @@ def run_v7_full():
 
                     if not user_text:
                         print("[V7 FULL AUDIO] No speech captured.")
+                        check_local_timer_tick()
                         face_idle()
                         continue
 
                     keep_running = handle_user_turn(user_text, camera_manager, safety)
+                    check_local_timer_tick()
                     if not keep_running:
                         break
 
@@ -603,11 +663,13 @@ def run_v7_full():
                     user_text = v6.capture_user_turn()
 
                     if not user_text:
+                        check_local_timer_tick()
                         continue
 
                     if is_global_idle_command(user_text):
                         print("[V7 FULL IDLE] Handling global idle command:", user_text)
                         keep_running = handle_user_turn(user_text, camera_manager, safety)
+                        check_local_timer_tick()
                         if not keep_running:
                             break
                         continue
@@ -621,10 +683,12 @@ def run_v7_full():
                     user_text = v6.capture_user_turn()
 
                     if not user_text:
+                        check_local_timer_tick()
                         face_idle()
                         continue
 
                     keep_running = handle_user_turn(user_text, camera_manager, safety)
+                    check_local_timer_tick()
                     if not keep_running:
                         break
 

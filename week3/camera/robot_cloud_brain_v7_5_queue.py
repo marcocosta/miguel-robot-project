@@ -31,6 +31,7 @@ if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
 import robot_cloud_brain_v7_full as full
+import robot_timer
 
 import robot_memory
 from v7.camera_intents import classify_camera_intent, is_identity_camera_request, is_scene_camera_request
@@ -216,6 +217,7 @@ class RobotRuntimeState:
     last_face_status_text: str = ""
     last_face_status_at: float = 0.0
     last_face_status_key: tuple[str, str] = field(default_factory=lambda: ("", ""))
+    last_face_block_log_at: float = 0.0
     last_unknown_face_visual_at: float = 0.0
     last_face_recognition_key: str = "none"
     last_user_text: str = ""
@@ -849,10 +851,12 @@ def notify_face_status(state: RobotRuntimeState, interaction_state: str, status_
         current_priority, current_state = _current_face_priority_locked(state)
         next_priority = _face_priority(face_state, face_text)
         if next_priority < current_priority:
-            print(
-                f"[V7.14 FACE] blocked lower priority update "
-                f"status={face_state} text={face_text} current={current_state}"
-            )
+            if now - float(state.last_face_block_log_at or 0.0) > 2.0:
+                state.last_face_block_log_at = now
+                print(
+                    f"[V7.14 FACE] blocked lower priority update "
+                    f"status={face_state} text={face_text} current={current_state}"
+                )
             return
         duplicate = state.last_face_status_key == face_key
         if (
@@ -924,17 +928,21 @@ def set_interaction_state(state: RobotRuntimeState, new_state: str, status_text:
             state.sleep_mode_active
             and new_state not in {"sleeping", "shutdown_pending", "speaking", "error"}
         ):
-            print(f"[V7.14 FACE] blocked lower priority update status={new_state} text={status_text} current=sleeping")
+            if now - float(state.last_face_block_log_at or 0.0) > 2.0:
+                state.last_face_block_log_at = now
+                print(f"[V7.14 FACE] blocked lower priority update status={new_state} text={status_text} current=sleeping")
             return
         elif (
-            state.turn_processing_active
-            and new_state in {"idle", "ready", "listening"}
+            (state.turn_processing_active or state.interaction_state in {"heard", "thinking", "looking"})
+            and (new_state in {"idle", "ready", "listening"} or _normalize_for_echo(status_text) == "ready")
             and state.interaction_state in {"heard", "thinking", "looking"}
         ):
-            print(
-                f"[V7.14 FACE] blocked lower priority update "
-                f"status={new_state} text={status_text} current={state.interaction_state}"
-            )
+            if now - float(state.last_face_block_log_at or 0.0) > 2.0:
+                state.last_face_block_log_at = now
+                print(
+                    f"[V7.14 FACE] blocked lower priority update "
+                    f"status={new_state} text={status_text} current={state.interaction_state}"
+                )
             return
         else:
             important_transition = (
@@ -1773,12 +1781,17 @@ def _restore_face_after_audio_capture(state: RobotRuntimeState) -> None:
 
 def capture_user_turn_when_ready(state: RobotRuntimeState) -> str:
     capture_started_at = time.time()
+    sleeping = _sleep_mode_active(state)
     if not prepare_to_listen(state):
         _mark_audio_capture_finished(state, "blocked")
         return ""
     _mark_audio_capture_active(state)
-    set_interaction_state(state, "listening", "YOUR TURN")
-    notify_face_status(state, "listening", "YOUR TURN")
+    if sleeping:
+        print("[V7.14 SLEEP] wake-only listening")
+        set_interaction_state(state, "sleeping", "Sleep")
+    else:
+        set_interaction_state(state, "listening", "YOUR TURN")
+        notify_face_status(state, "listening", "YOUR TURN")
     reason = "empty"
     try:
         user_text = v6.capture_user_turn()
@@ -1793,7 +1806,10 @@ def capture_user_turn_when_ready(state: RobotRuntimeState) -> str:
         raise
     finally:
         _mark_audio_capture_finished(state, reason)
-        _restore_face_after_audio_capture(state)
+        if reason == "transcript":
+            print("[V7.14 FACE] hold transcript state before routing")
+        else:
+            _restore_face_after_audio_capture(state)
 
 
 def _has_v7_5_wake_phrase(text: str) -> bool:
@@ -2267,19 +2283,52 @@ def _is_global_without_wake_command(text: str) -> bool:
         or _is_shutdown_request_text(normalized)
         or _is_shutdown_confirm_text(normalized)
         or _is_shutdown_cancel_text(normalized)
+        or _is_password_session_command(normalized)
+        or _is_harmless_local_bypass_request(normalized)
         or normalized in {"status", "emergency status", "pause", "cancel", "stop"}
     )
 
 
 def _is_password_session_command(text: str, state: RobotRuntimeState | None = None) -> bool:
     normalized = normalize_command_text(text)
-    if any(phrase in normalized for phrase in {"owner mode", "unlock owner mode", "lock owner mode", "require face recognition", "is password mode configured", "is owner password configured"}):
+    if any(
+        phrase in normalized
+        for phrase in {
+            "activate owner mode",
+            "can you activate owner mode",
+            "enable owner mode",
+            "owner mode",
+            "turn on owner mode",
+            "unlock owner mode",
+            "lock owner mode",
+            "require face recognition",
+            "is password mode configured",
+            "is owner password configured",
+        }
+    ):
         return True
     if state is not None:
         with state.lock:
             pending_unlock = bool(state.pending_owner_unlock_until and time.time() <= float(state.pending_owner_unlock_until))
         return pending_unlock
     return False
+
+
+def _is_harmless_local_bypass_request(text: str) -> bool:
+    normalized = normalize_command_text(text)
+    return normalized in {
+        "be creative",
+        "creative mode",
+        "long story mode",
+        "science joke",
+        "short answer",
+        "sleep mode",
+        "story mode",
+        "talk longer",
+        "talk normally",
+        "tell me a joke",
+        "tell me a science joke",
+    }
 
 
 def _show_wake_required(state: RobotRuntimeState, transcript: str = "", reason: str = "wake_required") -> None:
@@ -2612,7 +2661,14 @@ def _route_password_owner_session(user_text: str, state: RobotRuntimeState) -> b
         v6.speak("Face mode on.")
         return True
 
-    unlock_prefixes = {"unlock owner mode", "owner mode"}
+    unlock_prefixes = {
+        "activate owner mode",
+        "can you activate owner mode",
+        "enable owner mode",
+        "owner mode",
+        "turn on owner mode",
+        "unlock owner mode",
+    }
     for prefix in unlock_prefixes:
         if normalized == prefix or normalized.startswith(prefix + " "):
             _log_password_env_configured_once(state)
@@ -2698,6 +2754,69 @@ def _route_heard_repeat(user_text: str, state: RobotRuntimeState) -> bool:
     else:
         v6.speak("I heard part of it. Please repeat after YOUR TURN.")
     return True
+
+
+def _format_timer_duration(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    if seconds and seconds % 60 == 0:
+        minutes = seconds // 60
+        return f"{minutes} minute" + ("" if minutes == 1 else "s")
+    return f"{seconds} second" + ("" if seconds == 1 else "s")
+
+
+def _format_timer_remaining(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    minutes, remainder = divmod(seconds, 60)
+    if minutes:
+        return f"{minutes} minute{'s' if minutes != 1 else ''} and {remainder} second{'s' if remainder != 1 else ''}"
+    return f"{remainder} second" + ("" if remainder == 1 else "s")
+
+
+def _route_timer_local_reply(user_text: str, state: RobotRuntimeState) -> bool:
+    command = robot_timer.parse_timer_command(user_text)
+    if not command:
+        return False
+
+    intent = command.get("intent")
+    print(f"[V7.5 TIMER] handled locally intent={intent} text={_short_log_text(user_text)}")
+    if intent == "start_timer":
+        result = robot_timer.start_timer(int(command.get("seconds", 0) or 0))
+        _set_reply_context(state, "timer")
+        v6.speak(f"Timer set for {_format_timer_duration(result['seconds'])}.")
+        return True
+
+    if intent == "cancel_timer":
+        result = robot_timer.cancel_timer()
+        _set_reply_context(state, "timer")
+        if result.get("canceled"):
+            v6.speak("Timer canceled.")
+        else:
+            v6.speak("No timer is running.")
+        return True
+
+    if intent == "timer_status":
+        status = robot_timer.get_timer_status()
+        _set_reply_context(state, "timer")
+        if not status.get("active"):
+            v6.speak("No timer is running.")
+            return True
+        v6.speak(f"There are about {_format_timer_remaining(status['remaining_seconds'])} left.")
+        return True
+
+    return False
+
+
+def _check_timer_tick(state: RobotRuntimeState) -> None:
+    expired = robot_timer.timer_tick()
+    if not expired:
+        return
+    print("[V7.5 TIMER] expired")
+    try:
+        full.face_happy("Time is up")
+    except Exception as exc:
+        print("[V7.5 TIMER] face alert warning:", exc)
+    _set_reply_context(state, "timer")
+    v6.speak("Time is up.")
 
 
 def _route_creative_story_local_reply(user_text: str, state: RobotRuntimeState) -> bool:
@@ -3364,6 +3483,14 @@ def _route_fast_local_reply(user_text: str, state: RobotRuntimeState) -> bool:
 
     normalized = normalize_command_text(user_text)
 
+    if normalized in {"creative mode", "be creative"}:
+        start_conversation_session(state, mode="creative", partner=_current_owner_partner(state), reason="creative_mode")
+        with state.lock:
+            state.conversation_mode = "creative"
+        _set_response_length_context(state, "normal")
+        v6.speak("Creative mode.")
+        return True
+
     length_modes = {
         "short answer": ("terse", "Short mode."),
         "talk shorter": ("terse", "Short mode."),
@@ -3547,6 +3674,8 @@ def _route_fun_local_reply(user_text: str, state: RobotRuntimeState) -> bool:
             "make me laugh",
             "another joke",
             "do you know a joke",
+            "science joke",
+            "tell me a science joke",
         }
     ):
         index = abs(hash(normalized)) % len(LOCAL_JOKES)
@@ -3677,9 +3806,14 @@ def _is_sleep_mode_request(text: str) -> bool:
 
 def _is_sleep_wake_request(text: str) -> bool:
     normalized = normalize_command_text(text)
-    return normalized in {"miguel wake up", "wake up miguel", "mission control", "wake up"} or any(
-        phrase in normalized for phrase in {"miguel wake up", "wake up miguel", "mission control"}
-    )
+    wake_phrases = {
+        "miguel wake up",
+        "wake up miguel",
+        "hello miguel",
+        "hey miguel",
+        "mission control",
+    }
+    return normalized in wake_phrases or any(normalized.startswith(phrase + " ") for phrase in wake_phrases)
 
 
 def _activate_sleep_mode(state: RobotRuntimeState) -> None:
@@ -3735,6 +3869,36 @@ def _route_sleep_control(user_text: str, state: RobotRuntimeState, partner: str 
 
     print(f"[V7.14 SLEEP] ignored text={_short_log_text(user_text)}")
     _set_reply_context(state, "sleep_ignore")
+    set_interaction_state(state, "sleeping", "Sleep")
+    return True
+
+
+def _sleep_mode_active(state: RobotRuntimeState) -> bool:
+    with state.lock:
+        return bool(state.sleep_mode_active)
+
+
+def _handle_sleep_mode_audio_text(
+    user_turn_queue: queue.Queue,
+    state: RobotRuntimeState,
+    user_text: str,
+    recognized_person: str | None = None,
+) -> bool:
+    if not _sleep_mode_active(state):
+        return False
+    if _is_sleep_wake_request(user_text):
+        print(f"[V7.14 SLEEP] wake phrase accepted text={_short_log_text(user_text)}")
+        _enqueue_user_turn(
+            user_turn_queue,
+            state,
+            user_text,
+            recognized_person,
+            authorized=True,
+            authorization_source="wake_phrase",
+            stripped_text=_strip_wake_phrase(user_text),
+        )
+        return True
+    print(f"[V7.14 SLEEP] ignored non-wake text={_short_log_text(user_text)}")
     set_interaction_state(state, "sleeping", "Sleep")
     return True
 
@@ -4528,6 +4692,8 @@ def audio_worker(
                         else:
                             set_interaction_state(state, "shutdown_pending", "Confirm shutdown")
                         continue
+                    if _handle_sleep_mode_audio_text(user_turn_queue, state, user_text, recognized):
+                        continue
                     active = is_conversation_active(state)
                     directed = is_directed_to_miguel(user_text, state)
                     if active and (
@@ -4643,6 +4809,9 @@ def audio_worker(
                     )
                 else:
                     set_interaction_state(state, "shutdown_pending", "Confirm shutdown")
+                continue
+
+            if _handle_sleep_mode_audio_text(user_turn_queue, state, user_text, None):
                 continue
 
             if is_barge_in_command(user_text):
@@ -4959,6 +5128,17 @@ def handle_queued_turn(
         _mark_route_done(state, turn_started_at)
         return barge_result
 
+    _set_reply_context(state, "owner_password_ack")
+    if _route_password_owner_session(user_text, state):
+        _set_response_length_context(state, "terse")
+        _mark_route_done(state, turn_started_at)
+        return True
+
+    if _route_timer_local_reply(user_text, state):
+        _set_response_length_context(state, "terse")
+        _mark_route_done(state, turn_started_at)
+        return True
+
     camera_intent = classify_camera_intent(user_text)
     with state.lock:
         current_conversation_mode = state.conversation_mode
@@ -4981,12 +5161,6 @@ def handle_queued_turn(
     if shutdown_result is not None:
         _mark_route_done(state, turn_started_at)
         return shutdown_result
-
-    _set_reply_context(state, "owner_password_ack")
-    if _route_password_owner_session(user_text, state):
-        _set_response_length_context(state, "terse")
-        _mark_route_done(state, turn_started_at)
-        return True
 
     _set_reply_context(state, "normal")
     if _route_heard_repeat(user_text, state):
@@ -5343,6 +5517,7 @@ def run_v7_5_queue():
             threads.append(audio_thread)
 
             while not stop_event.is_set():
+                _check_timer_tick(state)
                 time.sleep(0.2)
 
     except KeyboardInterrupt:
