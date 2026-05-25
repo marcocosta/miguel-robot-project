@@ -1,0 +1,51 @@
+# Secrets
+.env
+*.key
+*secret*
+*credentials*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+week3/camera/venv/
+
+# Node
+node_modules/
+
+# Logs / runtime
+*.log
+logs/
+week3/logs/
+
+# Debug/generated images
+debug_snapshots/
+week3/debug_snapshots/
+
+# Face training/private biometric data
+week3/faces/
+week3/faces_backup_before_cleanup/
+week3/face_embeddings/
+week3/face_embedding_previews/
+
+# Local memory/runtime state
+week3/memory/
+
+# Large downloaded models
+week3/models/
+*.zip
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

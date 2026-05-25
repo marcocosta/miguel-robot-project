@@ -1,0 +1,53 @@
+Robot Brain Baseline
+Sun Apr 26 03:21:01 PM PDT 2026
+marquinho-bot-brain
+Linux marquinho-bot-brain 5.15.148-tegra #1 SMP PREEMPT Mon Jun 16 08:24:48 PDT 2025 aarch64 aarch64 aarch64 GNU/Linux
+Filesystem       Size  Used Avail Use% Mounted on
+/dev/mmcblk0p1   116G   22G   90G  19% /
+tmpfs            3.8G  120K  3.8G   1% /dev/shm
+tmpfs            1.5G   27M  1.5G   2% /run
+tmpfs            5.0M  4.0K  5.0M   1% /run/lock
+/dev/mmcblk0p10   63M   49M   15M  78% /boot/efi
+tmpfs            762M  120K  762M   1% /run/user/1000
+1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN group default qlen 1000
+    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00
+    inet 127.0.0.1/8 scope host lo
+       valid_lft forever preferred_lft forever
+    inet6 ::1/128 scope host 
+       valid_lft forever preferred_lft forever
+2: can0: <NOARP,ECHO> mtu 16 qdisc noop state DOWN group default qlen 10
+    link/can 
+3: wlP1p1s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    link/ether 9c:c7:d3:38:1b:af brd ff:ff:ff:ff:ff:ff
+    inet 10.0.0.190/24 brd 10.0.0.255 scope global dynamic noprefixroute wlP1p1s0
+       valid_lft 170111sec preferred_lft 170111sec
+    inet6 2601:646:8987:3ec0::7939/128 scope global dynamic noprefixroute 
+       valid_lft 220376sec preferred_lft 220376sec
+    inet6 2601:646:8987:3ec0:6595:7edc:1fbe:dcf6/64 scope global temporary dynamic 
+       valid_lft 223062sec preferred_lft 83559sec
+    inet6 2601:646:8987:3ec0:a0a8:122e:9d0a:c9f0/64 scope global dynamic mngtmpaddr noprefixroute 
+       valid_lft 223062sec preferred_lft 223062sec
+    inet6 fe80::1d9c:34b8:36ff:9739/64 scope link noprefixroute 
+       valid_lft forever preferred_lft forever
+4: l4tbr0: <BROADCAST,MULTICAST> mtu 1500 qdisc noop state DOWN group default qlen 1000
+    link/ether 3e:c7:e7:79:f3:87 brd ff:ff:ff:ff:ff:ff
+5: usb0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc pfifo_fast master l4tbr0 state DOWN group default qlen 1000
+    link/ether 42:4d:3c:35:b0:c1 brd ff:ff:ff:ff:ff:ff
+6: usb1: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc pfifo_fast master l4tbr0 state DOWN group default qlen 1000
+    link/ether 42:4d:3c:35:b0:c3 brd ff:ff:ff:ff:ff:ff
+7: enP8p1s0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 1000
+    link/ether 4c:bb:47:32:e6:8c brd ff:ff:ff:ff:ff:ff
+    inet 10.0.0.130/24 brd 10.0.0.255 scope global dynamic noprefixroute enP8p1s0
+       valid_lft 170106sec preferred_lft 170106sec
+    inet6 2601:646:8987:3ec0::11ca/128 scope global dynamic noprefixroute 
+       valid_lft 220369sec preferred_lft 220369sec
+    inet6 2601:646:8987:3ec0:6d3a:50f7:d3aa:d2b6/64 scope global temporary dynamic 
+       valid_lft 223062sec preferred_lft 82565sec
+    inet6 2601:646:8987:3ec0:da6c:2e3d:b3a2:9d9d/64 scope global dynamic mngtmpaddr noprefixroute 
+       valid_lft 223062sec preferred_lft 223062sec
+    inet6 fe80::ad47:e540:17a6:6b73/64 scope link noprefixroute 
+       valid_lft forever preferred_lft forever
+8: docker0: <NO-CARRIER,BROADCAST,MULTICAST,UP> mtu 1500 qdisc noqueue state DOWN group default 
+    link/ether 3e:66:e7:52:cc:50 brd ff:ff:ff:ff:ff:ff
+    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0
+       valid_lft forever preferred_lft forever
