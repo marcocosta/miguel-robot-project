@@ -1,0 +1,10 @@
+{
+  "emotion": null,
+  "is_speaking": false,
+  "look_x": 0.0,
+  "look_y": 0.0,
+  "message": null,
+  "simulated": true,
+  "state": "idle",
+  "timestamp": "not-started"
+}
