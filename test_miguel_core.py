@@ -5,7 +5,7 @@ from __future__ import annotations
 from pprint import pprint
 from tempfile import TemporaryDirectory
 
-from miguel_core import MiguelRuntime
+from miguel_core import MiguelHiWonderDryRunAdapter, MiguelHiWonderRealProbe, MiguelRuntime
 
 
 def _runtime() -> MiguelRuntime:
@@ -41,6 +41,7 @@ def test_explore_room_turn_right_allowed() -> dict:
     assert result["decision"]["action"] == "turn_right"
     assert result["command_result"]["payload"]["command"] == "turn_right"
     assert result["command_result"]["safety_validation"]["ok"] is True
+    assert result["command_result"]["adapter_result"]["dry_run"] is True
     assert result["mission_status"]["state"] == "active"
     runtime.shutdown()
     return result
@@ -106,6 +107,24 @@ def test_mission_controller_records_steps() -> dict:
     return result
 
 
+def test_default_bridge_uses_dry_run_adapter() -> dict:
+    runtime = _runtime()
+    assert isinstance(runtime.hiwonder.adapter, MiguelHiWonderDryRunAdapter)
+    assert runtime.hiwonder.adapter.get_name() == "dry_run"
+    telemetry = runtime.hiwonder.request_telemetry()
+    assert telemetry["simulated"] is True
+    assert telemetry["target"] == "hiwonder_car"
+    runtime.shutdown()
+    return telemetry
+
+
+def test_probe_runs_without_crashing() -> dict:
+    result = MiguelHiWonderRealProbe().probe()
+    assert result["ok"] is True
+    assert "likely_interfaces" in result
+    return result
+
+
 def main() -> None:
     result = test_explore_room_turn_right_allowed()
     test_unsafe_move_forward_blocked()
@@ -113,6 +132,8 @@ def main() -> None:
     test_long_duration_capped()
     test_emergency_stop_telemetry_stops_mission()
     test_mission_controller_records_steps()
+    test_default_bridge_uses_dry_run_adapter()
+    test_probe_runs_without_crashing()
 
     print("\nTelemetry:")
     pprint(result["telemetry"])
@@ -122,7 +143,7 @@ def main() -> None:
     pprint(result["command_result"])
     print("\nMission status:")
     pprint(result["mission_status"])
-    print("\nMiguel Core Lab v0.2 smoke test passed.")
+    print("\nMiguel Core Lab v0.3 smoke test passed.")
 
 
 if __name__ == "__main__":

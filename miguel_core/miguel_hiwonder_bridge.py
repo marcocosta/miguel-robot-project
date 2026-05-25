@@ -6,6 +6,8 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .miguel_hiwonder_adapter_base import MiguelHiWonderAdapterBase
+from .miguel_hiwonder_dry_run_adapter import MiguelHiWonderDryRunAdapter
 from .miguel_robot_bus import MiguelRobotBus
 from .miguel_safety import MiguelSafety
 
@@ -21,9 +23,11 @@ class MiguelHiWonderBridge:
         robot_bus: MiguelRobotBus,
         data_dir: str | Path = "data",
         safety: MiguelSafety | None = None,
+        adapter: MiguelHiWonderAdapterBase | None = None,
     ) -> None:
         self.robot_bus = robot_bus
         self.safety = safety or MiguelSafety()
+        self.adapter = adapter or MiguelHiWonderDryRunAdapter()
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.telemetry_path = self.data_dir / "miguel_hiwonder_telemetry.json"
@@ -35,13 +39,16 @@ class MiguelHiWonderBridge:
             {"reason": reason or "requested"},
             telemetry=self.robot_bus.get_latest_telemetry(self.TARGET),
         )
+        params = {"reason": reason or "requested"}
+        safety_payload = self._safety_payload(validation)
         result = self.robot_bus.send_command(
             self.TARGET,
             "stop",
-            {"reason": reason or "requested"},
-            self._safety_payload(validation),
+            params,
+            safety_payload,
         )
         result["safety_validation"] = validation
+        result["adapter_result"] = self.adapter.send_command("stop", params, safety_payload)
         return result
 
     def move_forward(self, speed: str = "slow", duration_sec: float = 1.0) -> dict:
@@ -64,30 +71,27 @@ class MiguelHiWonderBridge:
         )
         params = validation["adjusted_params"]
         print(f"[MIGUEL_HIWONDER] scan_area duration_sec={params['duration_sec']}")
+        safety_payload = self._safety_payload(validation)
         result = self.robot_bus.send_command(
             self.TARGET,
             "scan_area",
             params,
-            self._safety_payload(validation),
+            safety_payload,
         )
         result["safety_validation"] = validation
+        result["adapter_result"] = self.adapter.send_command("scan_area", params, safety_payload)
         return result
 
     def request_telemetry(self) -> dict:
-        telemetry = self.robot_bus.get_latest_telemetry(self.TARGET)
-        if telemetry is None:
-            telemetry = self._read_saved_telemetry()
-        if telemetry is None:
-            telemetry = self._simulated_safe_idle_telemetry()
-            self.update_telemetry(telemetry)
+        telemetry = self.adapter.request_telemetry()
+        telemetry = self._normalize_telemetry(telemetry)
+        self._write_json_atomic(self.telemetry_path, telemetry)
+        self.robot_bus.record_telemetry(self.TARGET, telemetry)
         print("[MIGUEL_HIWONDER] request_telemetry")
         return telemetry
 
     def update_telemetry(self, telemetry: dict) -> dict:
-        telemetry_record = dict(telemetry)
-        telemetry_record.setdefault("target", self.TARGET)
-        telemetry_record.setdefault("simulated", True)
-        telemetry_record.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        telemetry_record = self._normalize_telemetry(self.adapter.update_telemetry(telemetry))
         self._write_json_atomic(self.telemetry_path, telemetry_record)
         event = self.robot_bus.record_telemetry(self.TARGET, telemetry_record)
         print("[MIGUEL_HIWONDER] update_telemetry")
@@ -102,27 +106,32 @@ class MiguelHiWonderBridge:
         )
         if validation["blocked"]:
             print(f"[MIGUEL_HIWONDER] blocked command={command} reason={validation['reason']}")
+            stop_params = {
+                "reason": f"safety blocked {command}: {validation['reason']}",
+                "requested_command": command,
+            }
+            safety_payload = self._safety_payload(validation)
             result = self.robot_bus.send_command(
                 self.TARGET,
                 "stop",
-                {
-                    "reason": f"safety blocked {command}: {validation['reason']}",
-                    "requested_command": command,
-                },
-                self._safety_payload(validation),
+                stop_params,
+                safety_payload,
             )
             result["safety_validation"] = validation
+            result["adapter_result"] = self.adapter.send_command("stop", stop_params, safety_payload)
             return result
 
         params = validation["adjusted_params"]
         print(f"[MIGUEL_HIWONDER] {command} speed={params['speed']} duration_sec={params['duration_sec']}")
+        safety_payload = self._safety_payload(validation)
         result = self.robot_bus.send_command(
             self.TARGET,
             command,
             params,
-            self._safety_payload(validation),
+            safety_payload,
         )
         result["safety_validation"] = validation
+        result["adapter_result"] = self.adapter.send_command(command, params, safety_payload)
         return result
 
     def _safety_payload(self, validation: dict) -> dict:
@@ -134,6 +143,13 @@ class MiguelHiWonderBridge:
             }
         )
         return payload
+
+    def _normalize_telemetry(self, telemetry: dict) -> dict:
+        telemetry_record = dict(telemetry or {})
+        telemetry_record.setdefault("target", self.TARGET)
+        telemetry_record.setdefault("simulated", True)
+        telemetry_record.setdefault("timestamp", datetime.now(timezone.utc).isoformat())
+        return telemetry_record
 
     def _read_saved_telemetry(self) -> dict | None:
         if not self.telemetry_path.exists():

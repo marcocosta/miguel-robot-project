@@ -1,0 +1,402 @@
+{
+  "likely_interfaces": [
+    "unknown"
+  ],
+  "network_ports": [
+    {
+      "command": "ss -ltnup",
+      "line": "Netid State  Recv-Q Send-Q               Local Address:Port  Peer Address:PortProcess                                    "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "udp   UNCONN 0      0                       127.0.0.53:53         0.0.0.0:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "udp   UNCONN 0      0                          0.0.0.0:111        0.0.0.0:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "udp   UNCONN 0      0                          0.0.0.0:50365      0.0.0.0:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "udp   UNCONN 0      0                          0.0.0.0:5353       0.0.0.0:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "udp   UNCONN 0      0                                *:111              *:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "udp   UNCONN 0      0      [fe80::1d9c:34b8:36ff:9739]:546              *:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "udp   UNCONN 0      0                                *:5353             *:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "udp   UNCONN 0      0                                *:42857            *:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "udp   UNCONN 0      0                                *:52378            *:*    users:((\"firefox-bin\",pid=5366,fd=95))    "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "tcp   LISTEN 0      128                        0.0.0.0:22         0.0.0.0:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "tcp   LISTEN 0      4096                       0.0.0.0:111        0.0.0.0:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "tcp   LISTEN 0      4096                       0.0.0.0:631        0.0.0.0:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "tcp   LISTEN 0      4096                 127.0.0.53%lo:53         0.0.0.0:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "tcp   LISTEN 0      1024                     127.0.0.1:36657      0.0.0.0:*    users:((\"code-360a4e4fd2\",pid=13572,fd=9))"
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "tcp   LISTEN 0      128                           [::]:22            [::]:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "tcp   LISTEN 0      4096                          [::]:111           [::]:*                                              "
+    },
+    {
+      "command": "ss -ltnup",
+      "line": "tcp   LISTEN 0      4096                          [::]:631           [::]:*                                              "
+    }
+  ],
+  "notes": [
+    "Read-only probe only; no hardware commands were sent.",
+    "Python modules were checked with importlib.util.find_spec only."
+  ],
+  "ok": true,
+  "paths": [
+    {
+      "exists": false,
+      "is_dir": false,
+      "path": "/home/marquinho/hiwonder"
+    },
+    {
+      "exists": false,
+      "is_dir": false,
+      "path": "/home/marquinho/Hiwonder"
+    },
+    {
+      "exists": false,
+      "is_dir": false,
+      "path": "/home/marquinho/ros2_ws"
+    },
+    {
+      "exists": false,
+      "is_dir": false,
+      "path": "/home/marquinho/catkin_ws"
+    },
+    {
+      "children_sample": [
+        ".env",
+        ".git",
+        ".gitignore",
+        "docs",
+        "logs",
+        "miguel_core_lab",
+        "scripts",
+        "start_robot.sh",
+        "tests",
+        "week3"
+      ],
+      "exists": true,
+      "is_dir": true,
+      "path": "/home/marquinho/robot-project"
+    },
+    {
+      "children_sample": [
+        ".bash_history",
+        ".bash_logout",
+        ".bashrc",
+        ".cache",
+        ".codex",
+        ".config",
+        ".dotnet",
+        ".gitconfig",
+        ".gnupg",
+        ".insightface",
+        ".local",
+        ".npm",
+        ".npm-global",
+        ".npmrc",
+        ".profile",
+        ".ssh",
+        ".sudo_as_admin_successful",
+        ".vscode-server",
+        ".wget-hsts",
+        ".xsessionrc"
+      ],
+      "exists": true,
+      "is_dir": true,
+      "path": "/home/marquinho"
+    },
+    {
+      "exists": false,
+      "is_dir": false,
+      "path": "/opt/ros"
+    },
+    {
+      "children_sample": [],
+      "exists": true,
+      "is_dir": true,
+      "path": "/usr/local/lib/python3.10/dist-packages"
+    },
+    {
+      "children_sample": [
+        "AptUrl",
+        "Brlapi-0.8.3.egg-info",
+        "Brotli-1.0.9.egg-info",
+        "DistUpgrade",
+        "HweSupportStatus",
+        "Jetson",
+        "Jetson.GPIO-2.1.7.egg-info",
+        "LanguageSelector",
+        "Mako-1.1.3-py3.10.egg-info",
+        "MarkupSafe-2.0.1.egg-info",
+        "NvidiaDetector",
+        "Onboard",
+        "OpenGL",
+        "PIL",
+        "Pillow-9.0.1.egg-info",
+        "PyGObject-3.42.1.egg-info",
+        "PyJWT-2.3.0.egg-info",
+        "PyNaCl-1.5.0.dist-info",
+        "PyOpenGL-3.1.5.egg-info",
+        "PyYAML-5.4.1.egg-info"
+      ],
+      "exists": true,
+      "is_dir": true,
+      "path": "/usr/lib/python3/dist-packages"
+    }
+  ],
+  "processes": [
+    {
+      "line": "root         681  0.0  0.2  41828 16848 ?        Ss   06:59   0:00 /usr/bin/python3 /usr/bin/networkd-dispatcher --run-startup-triggers",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "root         685  0.0  0.1  27240 12996 ?        Ss   06:59   0:00 python3 /opt/nvidia/pva-allow-2/bin/nvidiaPvaAllowd.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2495  0.1  0.6 561116 52052 ?        Sl   06:59   0:19 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2685  0.0  0.2 511356 16564 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2689  0.0  0.2 511356 16588 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2690  0.0  0.2 511356 16592 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2691  0.0  0.2 511356 16588 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2694  0.0  0.2 511356 16596 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2695  0.0  0.2 511356 16592 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2704  0.0  0.2 511356 16588 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2706  0.0  0.2 511356 16592 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2709  0.0  0.2 511368 16840 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2711  0.0  0.2 511368 16844 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2713  0.0  0.2 511368 16844 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2715  0.0  0.2 511368 16844 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2717  0.0  0.2 511368 16848 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2718  0.0  0.2 511368 16840 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2719  0.0  0.2 511368 16848 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2720  0.0  0.2 511368 16848 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2721  0.1  0.2 511368 17296 ?        S    06:59   0:26 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2722  0.0  0.2 511368 16936 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+    2723  0.0  0.2 511368 16936 ?        S    06:59   0:00 python3 /usr/share/nvpmodel_indicator/nvpmodel_indicator.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+   18225  0.0  0.1  23372 12756 ?        Rs   12:17   0:00 python test_miguel_core.py",
+      "matches": [
+        "python"
+      ]
+    },
+    {
+      "line": "marquin+   18227  0.0  0.1  22016 11720 ?        Ss   12:17   0:00 python probe_hiwonder_environment.py",
+      "matches": [
+        "hiwonder",
+        "python"
+      ]
+    }
+  ],
+  "python_modules": [
+    {
+      "found": false,
+      "module": "rospy",
+      "origin": null
+    },
+    {
+      "found": false,
+      "module": "rclpy",
+      "origin": null
+    },
+    {
+      "found": false,
+      "module": "roslaunch",
+      "origin": null
+    },
+    {
+      "found": false,
+      "module": "smbus",
+      "origin": null
+    },
+    {
+      "found": false,
+      "module": "serial",
+      "origin": null
+    },
+    {
+      "found": true,
+      "module": "cv2",
+      "origin": "/usr/lib/python3.10/dist-packages/cv2/__init__.py"
+    },
+    {
+      "found": false,
+      "module": "depthai",
+      "origin": null
+    },
+    {
+      "found": false,
+      "module": "hiwonder",
+      "origin": null
+    },
+    {
+      "found": false,
+      "module": "HiwonderSDK",
+      "origin": null
+    },
+    {
+      "found": false,
+      "module": "ArmIK",
+      "origin": null
+    },
+    {
+      "found": false,
+      "module": "mecanum",
+      "origin": null
+    },
+    {
+      "found": false,
+      "module": "lidar",
+      "origin": null
+    },
+    {
+      "found": false,
+      "module": "ydlidar",
+      "origin": null
+    }
+  ]
+}
