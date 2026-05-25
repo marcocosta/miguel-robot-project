@@ -49,3 +49,6 @@ week3/models/
 .DS_Store
 .vscode/
 .idea/
+
+# Separate nested repo for modular Miguel core development
+miguel_core_lab/
