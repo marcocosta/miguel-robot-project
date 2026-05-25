@@ -25,13 +25,16 @@ class MiguelRobotBus:
         params: dict | None = None,
         safety: dict | None = None,
     ) -> dict:
+        safety_payload = safety or {}
         event = self._build_event(
             "command",
             {
                 "target": target,
                 "command": command,
                 "params": params or {},
-                "safety": safety or {},
+                "safety": safety_payload,
+                "safety_allowed": safety_payload.get("ok"),
+                "safety_blocked": safety_payload.get("blocked"),
                 "simulated": True,
                 "status": "accepted",
             },
