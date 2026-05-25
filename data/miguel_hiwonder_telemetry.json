@@ -1,0 +1,12 @@
+{
+  "battery_percent": 87,
+  "emergency_stop": false,
+  "front_clearance_cm": 120,
+  "left_clearance_cm": 95,
+  "nearest_obstacle_cm": 95,
+  "person_detected": false,
+  "person_direction": null,
+  "right_clearance_cm": 110,
+  "simulated": true,
+  "state": "idle"
+}
