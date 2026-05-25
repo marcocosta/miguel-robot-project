@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .miguel_robot_bus import MiguelRobotBus
+from .miguel_safety import MiguelSafety
 
 
 class MiguelHiWonderBridge:
@@ -15,20 +16,33 @@ class MiguelHiWonderBridge:
     TARGET = "hiwonder_car"
     SAFETY_STOP_IF_OBSTACLE_CM = 35
 
-    def __init__(self, robot_bus: MiguelRobotBus, data_dir: str | Path = "data") -> None:
+    def __init__(
+        self,
+        robot_bus: MiguelRobotBus,
+        data_dir: str | Path = "data",
+        safety: MiguelSafety | None = None,
+    ) -> None:
         self.robot_bus = robot_bus
+        self.safety = safety or MiguelSafety()
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.telemetry_path = self.data_dir / "miguel_hiwonder_telemetry.json"
 
     def stop(self, reason: str | None = None) -> dict:
         print(f"[MIGUEL_HIWONDER] stop reason={reason or 'none'}")
-        return self.robot_bus.send_command(
+        validation = self.safety.validate_command(
+            "stop",
+            {"reason": reason or "requested"},
+            telemetry=self.robot_bus.get_latest_telemetry(self.TARGET),
+        )
+        result = self.robot_bus.send_command(
             self.TARGET,
             "stop",
             {"reason": reason or "requested"},
-            {"hardware_safe": True},
+            self._safety_payload(validation),
         )
+        result["safety_validation"] = validation
+        return result
 
     def move_forward(self, speed: str = "slow", duration_sec: float = 1.0) -> dict:
         return self._movement_command("move_forward", speed, duration_sec)
@@ -43,13 +57,21 @@ class MiguelHiWonderBridge:
         return self._movement_command("turn_right", speed, duration_sec)
 
     def scan_area(self, duration_sec: float = 3.0) -> dict:
-        print(f"[MIGUEL_HIWONDER] scan_area duration_sec={duration_sec}")
-        return self.robot_bus.send_command(
+        validation = self.safety.validate_command(
+            "scan_area",
+            {"duration_sec": duration_sec},
+            telemetry=self.robot_bus.get_latest_telemetry(self.TARGET),
+        )
+        params = validation["adjusted_params"]
+        print(f"[MIGUEL_HIWONDER] scan_area duration_sec={params['duration_sec']}")
+        result = self.robot_bus.send_command(
             self.TARGET,
             "scan_area",
-            {"duration_sec": max(0.0, float(duration_sec))},
-            {"hardware_safe": True},
+            params,
+            self._safety_payload(validation),
         )
+        result["safety_validation"] = validation
+        return result
 
     def request_telemetry(self) -> dict:
         telemetry = self.robot_bus.get_latest_telemetry(self.TARGET)
@@ -72,17 +94,46 @@ class MiguelHiWonderBridge:
         return event
 
     def _movement_command(self, command: str, speed: str, duration_sec: float) -> dict:
-        safe_duration = max(0.0, float(duration_sec))
-        print(f"[MIGUEL_HIWONDER] {command} speed={speed} duration_sec={safe_duration}")
-        return self.robot_bus.send_command(
+        telemetry = self.robot_bus.get_latest_telemetry(self.TARGET)
+        validation = self.safety.validate_command(
+            command,
+            {"speed": speed, "duration_sec": duration_sec},
+            telemetry=telemetry,
+        )
+        if validation["blocked"]:
+            print(f"[MIGUEL_HIWONDER] blocked command={command} reason={validation['reason']}")
+            result = self.robot_bus.send_command(
+                self.TARGET,
+                "stop",
+                {
+                    "reason": f"safety blocked {command}: {validation['reason']}",
+                    "requested_command": command,
+                },
+                self._safety_payload(validation),
+            )
+            result["safety_validation"] = validation
+            return result
+
+        params = validation["adjusted_params"]
+        print(f"[MIGUEL_HIWONDER] {command} speed={params['speed']} duration_sec={params['duration_sec']}")
+        result = self.robot_bus.send_command(
             self.TARGET,
             command,
-            {"speed": speed, "duration_sec": safe_duration},
+            params,
+            self._safety_payload(validation),
+        )
+        result["safety_validation"] = validation
+        return result
+
+    def _safety_payload(self, validation: dict) -> dict:
+        payload = dict(validation)
+        payload.update(
             {
                 "stop_if_obstacle_cm": self.SAFETY_STOP_IF_OBSTACLE_CM,
                 "hardware_safe": True,
-            },
+            }
         )
+        return payload
 
     def _read_saved_telemetry(self) -> dict | None:
         if not self.telemetry_path.exists():
