@@ -7,9 +7,11 @@ from pprint import pprint
 from tempfile import TemporaryDirectory
 
 from miguel_core import (
+    MiguelHiWonderBridge,
     MiguelHiWonderDryRunAdapter,
     MiguelHiWonderFakeRos2Adapter,
     MiguelHiWonderRealProbe,
+    MiguelRobotBus,
     MiguelRuntime,
 )
 
@@ -20,6 +22,19 @@ class FakeTwistPublisher:
 
     def publish(self, payload: dict) -> None:
         self.payloads.append(dict(payload))
+
+
+class FakeTwistMethodPublisher:
+    def __init__(self) -> None:
+        self.payloads: list[dict] = []
+
+    def publish_twist(self, payload: dict) -> None:
+        self.payloads.append(dict(payload))
+
+
+class FailingTwistPublisher:
+    def publish(self, payload: dict) -> None:
+        raise RuntimeError("fake publisher failed")
 
 
 def _runtime() -> MiguelRuntime:
@@ -414,6 +429,129 @@ def test_stage2_fake_ros2_speed_cap() -> dict:
     return result
 
 
+def test_stage21_fake_ros2_publish_twist_method_supported() -> dict:
+    publisher = FakeTwistMethodPublisher()
+    adapter = MiguelHiWonderFakeRos2Adapter(publisher)
+    result = adapter.stop("publish_twist smoke")
+    assert result["ok"] is True
+    assert len(publisher.payloads) == 1
+    assert publisher.payloads[0]["topic"] == "/controller/cmd_vel"
+    return result
+
+
+def test_stage21_bridge_accepts_injected_fake_ros2_adapter() -> dict:
+    temp_dir = TemporaryDirectory()
+    publisher = FakeTwistPublisher()
+    adapter = MiguelHiWonderFakeRos2Adapter(publisher)
+    bus = MiguelRobotBus(temp_dir.name)
+    bridge = MiguelHiWonderBridge(bus, temp_dir.name, adapter=adapter)
+    bridge.arm()
+    bridge.update_telemetry(
+        {
+            "battery_percent": 82,
+            "emergency_stop": False,
+            "front_clearance_cm": 120,
+            "left_clearance_cm": 50,
+            "nearest_obstacle_cm": 60,
+            "person_detected": False,
+            "person_direction": None,
+            "right_clearance_cm": 90,
+            "state": "idle",
+            "simulated": True,
+        }
+    )
+
+    result = bridge.move_forward()
+    assert result["payload"]["status"] == "accepted"
+    assert result["payload"]["adapter_blocked"] is False
+    assert result["adapter_result"]["fake_ros2"] is True
+    assert result["adapter_result"]["command"] == "move_forward"
+    assert result["adapter_result"]["payload"]["linear"]["x"] > 0
+    assert len(publisher.payloads) == 2
+    assert publisher.payloads[0]["linear"]["x"] > 0
+    assert publisher.payloads[1]["linear"]["x"] == 0.0
+    temp_dir.cleanup()
+    return result
+
+
+def test_stage21_fake_ros2_publisher_failure_is_reported() -> dict:
+    adapter = MiguelHiWonderFakeRos2Adapter(FailingTwistPublisher())
+    adapter.arm()
+    result = adapter.set_velocity("move_forward", "slow", 1.0)
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert result["error"] is True
+    assert result["reason"] == "publisher_error"
+    return result
+
+
+def test_stage21_fake_ros2_move_backward_sign() -> dict:
+    publisher = FakeTwistPublisher()
+    adapter = MiguelHiWonderFakeRos2Adapter(publisher)
+    adapter.arm()
+    result = adapter.set_velocity("move_backward", "slow", 1.0)
+    assert result["payload"]["linear"]["x"] < 0
+    assert publisher.payloads[0]["linear"]["x"] < 0
+    assert publisher.payloads[1]["linear"]["x"] == 0.0
+    return result
+
+
+def test_stage21_fake_ros2_negative_duration_clamps_to_zero() -> dict:
+    publisher = FakeTwistPublisher()
+    adapter = MiguelHiWonderFakeRos2Adapter(publisher)
+    adapter.arm()
+    result = adapter.set_velocity("move_forward", "slow", -3.0)
+    assert result["ok"] is True
+    assert result["payload"]["duration_sec"] == 0.0
+    return result
+
+
+def test_stage21_fake_ros2_nonnumeric_duration_clamps_to_zero() -> dict:
+    publisher = FakeTwistPublisher()
+    adapter = MiguelHiWonderFakeRos2Adapter(publisher)
+    adapter.arm()
+    result = adapter.set_velocity("move_forward", "slow", "not-a-duration")
+    assert result["ok"] is True
+    assert result["payload"]["duration_sec"] == 0.0
+    return result
+
+
+def test_stage21_fake_ros2_disarm_publishes_stop_and_disarms() -> dict:
+    publisher = FakeTwistPublisher()
+    adapter = MiguelHiWonderFakeRos2Adapter(publisher)
+    adapter.arm()
+    result = adapter.disarm()
+    assert adapter.armed is False
+    assert result["ok"] is True
+    assert result["stop_result"]["command"] == "stop"
+    assert publisher.payloads[-1]["linear"]["x"] == 0.0
+    assert publisher.payloads[-1]["angular"]["z"] == 0.0
+    return result
+
+
+def test_stage21_fake_ros2_disarm_while_disarmed_is_safe_stop() -> dict:
+    publisher = FakeTwistPublisher()
+    adapter = MiguelHiWonderFakeRos2Adapter(publisher)
+    result = adapter.disarm()
+    assert adapter.armed is False
+    assert result["ok"] is True
+    assert len(publisher.payloads) == 1
+    assert publisher.payloads[0]["linear"]["x"] == 0.0
+    return result
+
+
+def test_stage21_fake_ros2_unknown_command_blocks_without_publish() -> dict:
+    publisher = FakeTwistPublisher()
+    adapter = MiguelHiWonderFakeRos2Adapter(publisher)
+    adapter.arm()
+    result = adapter.set_velocity("spin", "slow", 1.0)
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert result["reason"] == "unknown_movement_command"
+    assert publisher.payloads == []
+    return result
+
+
 def main() -> None:
     result = test_explore_room_turn_right_allowed()
     test_unsafe_move_forward_blocked()
@@ -450,6 +588,15 @@ def main() -> None:
     test_stage2_fake_ros2_close_publishes_stop_and_disarms()
     test_stage2_fake_ros2_duration_cap()
     test_stage2_fake_ros2_speed_cap()
+    test_stage21_fake_ros2_publish_twist_method_supported()
+    test_stage21_bridge_accepts_injected_fake_ros2_adapter()
+    test_stage21_fake_ros2_publisher_failure_is_reported()
+    test_stage21_fake_ros2_move_backward_sign()
+    test_stage21_fake_ros2_negative_duration_clamps_to_zero()
+    test_stage21_fake_ros2_nonnumeric_duration_clamps_to_zero()
+    test_stage21_fake_ros2_disarm_publishes_stop_and_disarms()
+    test_stage21_fake_ros2_disarm_while_disarmed_is_safe_stop()
+    test_stage21_fake_ros2_unknown_command_blocks_without_publish()
 
     print("\nTelemetry:")
     pprint(result["telemetry"])

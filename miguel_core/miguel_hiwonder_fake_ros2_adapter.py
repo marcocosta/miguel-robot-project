@@ -35,12 +35,36 @@ class MiguelHiWonderFakeRos2Adapter(MiguelHiWonderAdapterBase):
         return self._record("arm", ok=True)
 
     def disarm(self) -> dict:
+        stop_result = self.stop("adapter disarm")
         self.armed = False
-        return self._record("disarm", ok=True)
+        result = self._record(
+            "disarm",
+            ok=stop_result["ok"],
+            blocked=stop_result.get("blocked", False),
+            error=stop_result.get("error", False),
+            reason=stop_result["reason"],
+            params={"reason": "adapter disarm"},
+            payload=stop_result.get("payload"),
+        )
+        result["stop_result"] = stop_result
+        return result
 
     def stop(self, reason: str | None = None) -> dict:
         payload = self._twist_payload(0.0, 0.0, 0.0, 0.0)
-        self._publish(payload)
+        publish_result = self._publish(payload)
+        if not publish_result["ok"]:
+            return self._record(
+                "stop",
+                ok=False,
+                blocked=True,
+                error=True,
+                reason="publisher_error",
+                params={
+                    "reason": reason or "requested",
+                    "error": publish_result["error"],
+                },
+                payload=payload,
+            )
         return self._record(
             "stop",
             ok=True,
@@ -71,9 +95,27 @@ class MiguelHiWonderFakeRos2Adapter(MiguelHiWonderAdapterBase):
             self._cap_number(angular_z, -self.MAX_ANGULAR_Z, self.MAX_ANGULAR_Z),
             duration,
         )
-        self._publish(payload)
+        publish_result = self._publish(payload)
+        if not publish_result["ok"]:
+            return self._record(
+                "drive_twist",
+                ok=False,
+                blocked=True,
+                error=True,
+                reason="publisher_error",
+                params={
+                    "duration_sec": duration,
+                    "error": publish_result["error"],
+                },
+                payload=payload,
+            )
         result = self._record("drive_twist", ok=True, params={"duration_sec": duration}, payload=payload)
         result["followup_stop"] = self.stop("timed movement complete")
+        if not result["followup_stop"]["ok"]:
+            result["ok"] = False
+            result["blocked"] = True
+            result["error"] = True
+            result["reason"] = result["followup_stop"]["reason"]
         return result
 
     def set_velocity(self, command: str, speed: str = "slow", duration_sec: float = 1.0) -> dict:
@@ -179,13 +221,17 @@ class MiguelHiWonderFakeRos2Adapter(MiguelHiWonderAdapterBase):
         self.stop("adapter close")
         self.armed = False
 
-    def _publish(self, payload: dict) -> None:
-        if hasattr(self.publisher, "publish_twist"):
-            self.publisher.publish_twist(payload)
-        elif hasattr(self.publisher, "publish"):
-            self.publisher.publish(payload)
-        else:
-            raise TypeError("publisher must expose publish(payload) or publish_twist(payload)")
+    def _publish(self, payload: dict) -> dict:
+        try:
+            if hasattr(self.publisher, "publish_twist"):
+                self.publisher.publish_twist(payload)
+            elif hasattr(self.publisher, "publish"):
+                self.publisher.publish(payload)
+            else:
+                raise TypeError("publisher must expose publish(payload) or publish_twist(payload)")
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "error": None}
 
     def _twist_payload(self, linear_x: float, linear_y: float, angular_z: float, duration_sec: float) -> dict:
         return {
@@ -205,12 +251,14 @@ class MiguelHiWonderFakeRos2Adapter(MiguelHiWonderAdapterBase):
         params: dict | None = None,
         payload: dict | None = None,
         blocked: bool = False,
+        error: bool = False,
         reason: str | None = None,
     ) -> dict:
         result = {
             "id": next(self._ids),
             "ok": ok,
             "blocked": blocked,
+            "error": error,
             "reason": reason or ("ok" if ok else "blocked"),
             "dry_run": True,
             "fake_ros2": True,
