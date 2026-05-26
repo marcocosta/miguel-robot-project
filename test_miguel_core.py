@@ -64,6 +64,47 @@ def failing_twist_factory(**kwargs: object) -> dict:
     raise RuntimeError("twist factory failed")
 
 
+def clean_readiness_report(**overrides: object) -> dict:
+    report = {
+        "ok": True,
+        "cmd_vel_safe_to_arm": True,
+        "competing_cmd_vel_publishers": [],
+        "battery_ok": True,
+        "battery_readable": True,
+        "lidar_ok": True,
+        "lidar_readable": True,
+        "odom_ok": True,
+        "odom_readable": True,
+        "movement_tested": False,
+        "hardware_verified": False,
+        "graph": {
+            "cmd_vel": {
+                "topic": "/controller/cmd_vel",
+                "topic_exists": True,
+                "message_type": "geometry_msgs/msg/Twist",
+                "publisher_count": 0,
+                "subscription_count": 1,
+                "publisher_nodes": [],
+                "subscriber_nodes": ["odom_publisher"],
+                "competing_publishers": [],
+                "safe_to_arm": True,
+            }
+        },
+    }
+    report.update(overrides)
+    return report
+
+
+class FakeReadinessProbe:
+    def __init__(self, report: dict) -> None:
+        self.report = report
+        self.calls = 0
+
+    def build_readiness_report(self) -> dict:
+        self.calls += 1
+        return dict(self.report)
+
+
 class FakeRos2Vector:
     def __init__(self) -> None:
         self.x = 0.0
@@ -1206,7 +1247,10 @@ def test_stage4_allow_real_ros2_missing_dependencies_is_structured() -> dict:
 
     ros2_module.importlib.import_module = missing_ros_import
     try:
-        adapter = MiguelHiWonderRos2Adapter(allow_real_ros2=True)
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            require_safe_graph_to_arm=False,
+        )
     finally:
         ros2_module.importlib.import_module = original_import_module
 
@@ -1223,7 +1267,10 @@ def test_stage4_allow_real_ros2_missing_dependencies_is_structured() -> dict:
 def test_stage4_fake_real_ros2_backend_constructs_without_publish() -> dict:
     saved, rclpy = _install_fake_ros2_modules()
     try:
-        adapter = MiguelHiWonderRos2Adapter(allow_real_ros2=True)
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            require_safe_graph_to_arm=False,
+        )
         status = adapter.backend_status()
         assert status["available"] is True
         assert status["backend"] == "real_ros2"
@@ -1259,7 +1306,10 @@ def test_stage4_fake_real_ros2_stop_publishes_zero_twist() -> dict:
 def test_stage4_fake_real_ros2_arm_move_forward_publishes_twist_and_stop() -> dict:
     saved, rclpy = _install_fake_ros2_modules()
     try:
-        adapter = MiguelHiWonderRos2Adapter(allow_real_ros2=True)
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            require_safe_graph_to_arm=False,
+        )
         adapter.arm()
         result = adapter.set_velocity("move_forward", "slow", 1.0)
         publisher = rclpy.created_nodes[0].publishers[0]
@@ -1280,7 +1330,10 @@ def test_stage4_fake_real_ros2_arm_move_forward_publishes_twist_and_stop() -> di
 def test_stage4_fake_real_ros2_close_destroys_owned_node() -> dict:
     saved, rclpy = _install_fake_ros2_modules()
     try:
-        adapter = MiguelHiWonderRos2Adapter(allow_real_ros2=True)
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            require_safe_graph_to_arm=False,
+        )
         node = rclpy.created_nodes[0]
         adapter.arm()
         result = adapter.close()
@@ -1433,6 +1486,213 @@ def test_stage5_ros2_probe_destroy_failure_is_structured() -> dict:
     assert "probe destroy failed" in result["error"]
     assert probe.node is None
     return result
+
+
+def test_stage9_ros2_arm_refuses_competing_publishers() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        report = clean_readiness_report(
+            cmd_vel_safe_to_arm=False,
+            competing_cmd_vel_publishers=["lidar_app"],
+            graph={
+                "cmd_vel": {
+                    "topic_exists": True,
+                    "message_type": "geometry_msgs/msg/Twist",
+                    "subscription_count": 1,
+                    "competing_publishers": ["lidar_app"],
+                    "safe_to_arm": False,
+                }
+            },
+        )
+        probe = FakeReadinessProbe(report)
+        adapter = MiguelHiWonderRos2Adapter(allow_real_ros2=True, readiness_probe=probe)
+        result = adapter.arm()
+        assert result["ok"] is False
+        assert result["blocked"] is True
+        assert result["armed"] is False
+        assert adapter.armed is False
+        assert result["reason"] == "ros2_graph_not_safe_to_arm"
+        assert result["payload"]["competing_cmd_vel_publishers"] == ["lidar_app"]
+        assert rclpy.created_nodes[0].publishers[0].messages == []
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage9_ros2_arm_refuses_missing_cmd_vel() -> dict:
+    saved, _rclpy = _install_fake_ros2_modules()
+    try:
+        report = clean_readiness_report(
+            graph={
+                "cmd_vel": {
+                    "topic_exists": False,
+                    "message_type": None,
+                    "subscription_count": 0,
+                    "competing_publishers": [],
+                }
+            }
+        )
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(report),
+        )
+        result = adapter.arm()
+        assert result["ok"] is False
+        assert result["reason"] == "cmd_vel_topic_missing"
+        assert adapter.armed is False
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage9_ros2_arm_refuses_no_cmd_vel_subscriber() -> dict:
+    saved, _rclpy = _install_fake_ros2_modules()
+    try:
+        report = clean_readiness_report(
+            graph={
+                "cmd_vel": {
+                    "topic_exists": True,
+                    "message_type": "geometry_msgs/msg/Twist",
+                    "subscription_count": 0,
+                    "competing_publishers": [],
+                }
+            }
+        )
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(report),
+        )
+        result = adapter.arm()
+        assert result["ok"] is False
+        assert result["reason"] == "cmd_vel_no_subscriber"
+        assert adapter.armed is False
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage9_ros2_arm_refuses_wrong_cmd_vel_type() -> dict:
+    saved, _rclpy = _install_fake_ros2_modules()
+    try:
+        report = clean_readiness_report(
+            graph={
+                "cmd_vel": {
+                    "topic_exists": True,
+                    "message_type": "std_msgs/msg/String",
+                    "subscription_count": 1,
+                    "competing_publishers": [],
+                }
+            }
+        )
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(report),
+        )
+        result = adapter.arm()
+        assert result["ok"] is False
+        assert result["reason"] == "cmd_vel_wrong_message_type"
+        assert adapter.armed is False
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage9_ros2_arm_succeeds_with_clean_readiness() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(clean_readiness_report()),
+        )
+        result = adapter.arm()
+        assert result["ok"] is True
+        assert result["armed"] is True
+        assert adapter.armed is True
+        assert result["payload"]["cmd_vel_safe_to_arm"] is True
+        assert rclpy.created_nodes[0].publishers[0].messages == []
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage9_ros2_arm_override_allows_competing_publishers_with_warning() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        report = clean_readiness_report(
+            cmd_vel_safe_to_arm=False,
+            competing_cmd_vel_publishers=["lidar_app"],
+            graph={
+                "cmd_vel": {
+                    "topic_exists": True,
+                    "message_type": "geometry_msgs/msg/Twist",
+                    "subscription_count": 1,
+                    "competing_publishers": ["lidar_app"],
+                    "safe_to_arm": False,
+                }
+            },
+        )
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(report),
+            allow_competing_publishers_override=True,
+        )
+        result = adapter.arm()
+        assert result["ok"] is True
+        assert adapter.armed is True
+        assert result["params"]["readiness_warnings"][0]["reason"] == "competing_cmd_vel_publishers_override"
+        assert rclpy.created_nodes[0].publishers[0].messages == []
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage9_ros2_movement_blocked_after_failed_arm() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        report = clean_readiness_report(
+            cmd_vel_safe_to_arm=False,
+            competing_cmd_vel_publishers=["joystick_control"],
+            graph={
+                "cmd_vel": {
+                    "topic_exists": True,
+                    "message_type": "geometry_msgs/msg/Twist",
+                    "subscription_count": 1,
+                    "competing_publishers": ["joystick_control"],
+                    "safe_to_arm": False,
+                }
+            },
+        )
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(report),
+        )
+        arm_result = adapter.arm()
+        move_result = adapter.set_velocity("move_forward", "slow", 1.0)
+        assert arm_result["ok"] is False
+        assert move_result["ok"] is False
+        assert move_result["blocked"] is True
+        assert move_result["reason"] == "adapter_disarmed"
+        assert rclpy.created_nodes[0].publishers[0].messages == []
+        return {"arm": arm_result, "move": move_result}
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage9_ros2_arm_refuses_unreadable_sensor() -> dict:
+    saved, _rclpy = _install_fake_ros2_modules()
+    try:
+        report = clean_readiness_report(lidar_readable=False, lidar_ok=False)
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(report),
+        )
+        result = adapter.arm()
+        assert result["ok"] is False
+        assert result["reason"] == "lidar_not_readable"
+        assert adapter.armed is False
+        return result
+    finally:
+        _restore_modules(saved)
 
 
 def test_stage8_graph_probe_module_import_is_inert() -> dict:
@@ -1729,6 +1989,14 @@ def main() -> None:
     test_stage5_ros2_probe_readiness_never_tests_movement()
     test_stage5_ros2_probe_node_creation_failure_is_structured()
     test_stage5_ros2_probe_destroy_failure_is_structured()
+    test_stage9_ros2_arm_refuses_competing_publishers()
+    test_stage9_ros2_arm_refuses_missing_cmd_vel()
+    test_stage9_ros2_arm_refuses_no_cmd_vel_subscriber()
+    test_stage9_ros2_arm_refuses_wrong_cmd_vel_type()
+    test_stage9_ros2_arm_succeeds_with_clean_readiness()
+    test_stage9_ros2_arm_override_allows_competing_publishers_with_warning()
+    test_stage9_ros2_movement_blocked_after_failed_arm()
+    test_stage9_ros2_arm_refuses_unreadable_sensor()
     test_stage8_graph_probe_module_import_is_inert()
     test_stage8_graph_probe_constructor_is_inert()
     test_stage8_fake_node_list_and_topics_work()

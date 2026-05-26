@@ -35,6 +35,9 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
         twist_factory: Callable[..., object] | None = None,
         clock: object | None = None,
         allow_real_ros2: bool = False,
+        readiness_probe: object | None = None,
+        require_safe_graph_to_arm: bool = True,
+        allow_competing_publishers_override: bool = False,
     ) -> None:
         self.node = node
         self.publisher = publisher
@@ -42,6 +45,9 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
         self.twist_factory = twist_factory
         self.clock = clock
         self.allow_real_ros2 = allow_real_ros2
+        self.readiness_probe = readiness_probe
+        self.require_safe_graph_to_arm = require_safe_graph_to_arm
+        self.allow_competing_publishers_override = allow_competing_publishers_override
         self.armed = False
         self.command_log: list[dict] = []
         self._latest_telemetry: dict | None = None
@@ -80,8 +86,25 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
     def arm(self) -> dict:
         if not self.available:
             return self._unavailable("arm")
+        gate_result = self._validate_arm_readiness()
+        if not gate_result["ok"]:
+            return self._record(
+                "arm",
+                ok=False,
+                blocked=True,
+                reason=gate_result["reason"],
+                params={
+                    "readiness_warnings": gate_result.get("warnings", []),
+                },
+                payload=gate_result.get("readiness_report"),
+            )
         self.armed = True
-        return self._record("arm", ok=True)
+        return self._record(
+            "arm",
+            ok=True,
+            params={"readiness_warnings": gate_result.get("warnings", [])},
+            payload=gate_result.get("readiness_report"),
+        )
 
     def disarm(self) -> dict:
         stop_result = self.stop("adapter disarm")
@@ -351,6 +374,119 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
         self.hardware_verified = False
         self.unavailable_reason = "ok"
         self.init_error = None
+
+    def _validate_arm_readiness(self) -> dict:
+        should_check = self.readiness_probe is not None or (
+            self.backend == "real_ros2" and self.require_safe_graph_to_arm
+        )
+        if not should_check:
+            return {"ok": True, "reason": "ok", "warnings": []}
+
+        try:
+            if self.readiness_probe is None:
+                from .miguel_hiwonder_ros2_graph_probe import MiguelHiWonderRos2GraphProbe
+
+                self.readiness_probe = MiguelHiWonderRos2GraphProbe(node=self.node)
+            report = self.readiness_probe.build_readiness_report()
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": "ros2_readiness_probe_error",
+                "readiness_report": {"error": str(exc)},
+                "warnings": [],
+            }
+
+        warnings = []
+        cmd_vel = report.get("graph", {}).get("cmd_vel", {})
+        if not cmd_vel and "cmd_vel" in report:
+            cmd_vel = report.get("cmd_vel", {})
+
+        topic_exists = cmd_vel.get("topic_exists")
+        message_type = cmd_vel.get("message_type")
+        subscription_count = int(cmd_vel.get("subscription_count") or 0)
+        competing_publishers = list(
+            report.get("competing_cmd_vel_publishers")
+            or cmd_vel.get("competing_publishers")
+            or []
+        )
+        cmd_vel_safe_to_arm = report.get("cmd_vel_safe_to_arm", cmd_vel.get("safe_to_arm"))
+
+        if report.get("ok") is False:
+            return {
+                "ok": False,
+                "reason": "ros2_readiness_failed",
+                "readiness_report": report,
+                "warnings": warnings,
+            }
+        if topic_exists is not True:
+            return {
+                "ok": False,
+                "reason": "cmd_vel_topic_missing",
+                "readiness_report": report,
+                "warnings": warnings,
+            }
+        if message_type != "geometry_msgs/msg/Twist":
+            return {
+                "ok": False,
+                "reason": "cmd_vel_wrong_message_type",
+                "readiness_report": report,
+                "warnings": warnings,
+            }
+        if subscription_count < 1:
+            return {
+                "ok": False,
+                "reason": "cmd_vel_no_subscriber",
+                "readiness_report": report,
+                "warnings": warnings,
+            }
+        if cmd_vel_safe_to_arm is False and not (
+            competing_publishers and self.allow_competing_publishers_override
+        ):
+            return {
+                "ok": False,
+                "reason": "ros2_graph_not_safe_to_arm",
+                "readiness_report": report,
+                "warnings": warnings,
+            }
+        if competing_publishers and not self.allow_competing_publishers_override:
+            return {
+                "ok": False,
+                "reason": "ros2_graph_not_safe_to_arm",
+                "readiness_report": report,
+                "warnings": warnings,
+            }
+        if competing_publishers:
+            warnings.append(
+                {
+                    "reason": "competing_cmd_vel_publishers_override",
+                    "publishers": competing_publishers,
+                }
+            )
+
+        for sensor_name in ("battery", "lidar", "odom"):
+            readable_key = f"{sensor_name}_readable"
+            ok_key = f"{sensor_name}_ok"
+            if readable_key in report and report.get(readable_key) is not True:
+                return {
+                    "ok": False,
+                    "reason": f"{sensor_name}_not_readable",
+                    "readiness_report": report,
+                    "warnings": warnings,
+                }
+            if ok_key in report and report.get(ok_key) is not True:
+                return {
+                    "ok": False,
+                    "reason": f"{sensor_name}_not_ready",
+                    "readiness_report": report,
+                    "warnings": warnings,
+                }
+
+        return {
+            "ok": True,
+            "reason": "ok",
+            "readiness_report": report,
+            "warnings": warnings,
+        }
 
     def _unavailable(
         self,
