@@ -4,6 +4,7 @@ from .miguel_face_display import MiguelFaceDisplay
 from .miguel_hiwonder_adapter_base import MiguelHiWonderAdapterBase
 from .miguel_hiwonder_bridge import MiguelHiWonderBridge
 from .miguel_hiwonder_dry_run_adapter import MiguelHiWonderDryRunAdapter
+from .miguel_hiwonder_fake_ros2_adapter import MiguelHiWonderFakeRos2Adapter
 from .miguel_hiwonder_real_probe import MiguelHiWonderRealProbe
 from .miguel_learning import MiguelLearning
 from .miguel_mission import MiguelMissionController
@@ -19,6 +20,7 @@ __all__ = [
     "MiguelHiWonderAdapterBase",
     "MiguelHiWonderBridge",
     "MiguelHiWonderDryRunAdapter",
+    "MiguelHiWonderFakeRos2Adapter",
     "MiguelHiWonderRealProbe",
     "MiguelLearning",
     "MiguelMissionController",
