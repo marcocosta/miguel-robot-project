@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import importlib
+import math
 import sys
 import types
 from pprint import pprint
@@ -15,6 +16,7 @@ from miguel_core import (
     MiguelHiWonderFakeRos2Adapter,
     MiguelHiWonderRealProbe,
     MiguelHiWonderRos2Adapter,
+    MiguelHiWonderRos2GraphProbe,
     MiguelHiWonderRos2Probe,
     MiguelRobotBus,
     MiguelRuntime,
@@ -105,6 +107,138 @@ class FailingRos2Node(FakeRos2Node):
         raise RuntimeError("probe destroy failed")
 
 
+class FakeEndpointInfo:
+    def __init__(self, node_name: str, node_namespace: str = "") -> None:
+        self.node_name = node_name
+        self.node_namespace = node_namespace
+
+
+class FakeRos2GraphNode:
+    def __init__(
+        self,
+        nodes: list[str] | None = None,
+        topics: list[tuple[str, list[str]]] | None = None,
+        publisher_nodes_by_topic: dict[str, list[str]] | None = None,
+        subscriber_nodes_by_topic: dict[str, list[str]] | None = None,
+        messages_by_topic: dict[str, list[object]] | None = None,
+    ) -> None:
+        self.node_names = nodes or []
+        self.topics = topics or []
+        self.publisher_nodes_by_topic = publisher_nodes_by_topic or {}
+        self.subscriber_nodes_by_topic = subscriber_nodes_by_topic or {}
+        self.messages_by_topic = messages_by_topic or {}
+        self.subscriptions: list[object] = []
+        self.destroyed_subscriptions: list[object] = []
+        self.destroyed = False
+
+    def get_node_names(self) -> list[str]:
+        return list(self.node_names)
+
+    def get_topic_names_and_types(self) -> list[tuple[str, list[str]]]:
+        return list(self.topics)
+
+    def count_publishers(self, topic: str) -> int:
+        return len(self.publisher_nodes_by_topic.get(topic, []))
+
+    def count_subscribers(self, topic: str) -> int:
+        return len(self.subscriber_nodes_by_topic.get(topic, []))
+
+    def get_publishers_info_by_topic(self, topic: str) -> list[FakeEndpointInfo]:
+        return [FakeEndpointInfo(name) for name in self.publisher_nodes_by_topic.get(topic, [])]
+
+    def get_subscriptions_info_by_topic(self, topic: str) -> list[FakeEndpointInfo]:
+        return [FakeEndpointInfo(name) for name in self.subscriber_nodes_by_topic.get(topic, [])]
+
+    def create_subscription(
+        self,
+        message_type: object,
+        topic: str,
+        callback: object,
+        depth: int,
+    ) -> dict:
+        subscription = {
+            "message_type": message_type,
+            "topic": topic,
+            "callback": callback,
+            "depth": depth,
+        }
+        self.subscriptions.append(subscription)
+        return subscription
+
+    def destroy_subscription(self, subscription: object) -> None:
+        self.destroyed_subscriptions.append(subscription)
+
+    def spin_once(self) -> None:
+        for subscription in list(self.subscriptions):
+            topic = subscription["topic"]
+            if self.messages_by_topic.get(topic):
+                subscription["callback"](self.messages_by_topic[topic].pop(0))
+
+    def destroy_node(self) -> None:
+        self.destroyed = True
+
+
+class FakeUInt16:
+    def __init__(self, data: int = 0) -> None:
+        self.data = data
+
+
+class FakeHeader:
+    def __init__(self, frame_id: str = "") -> None:
+        self.frame_id = frame_id
+
+
+class FakeLaserScan:
+    def __init__(
+        self,
+        ranges: list[float],
+        angle_min: float,
+        angle_increment: float,
+        range_min: float = 0.0,
+        range_max: float = 10.0,
+        frame_id: str = "laser",
+    ) -> None:
+        self.ranges = ranges
+        self.angle_min = angle_min
+        self.angle_increment = angle_increment
+        self.range_min = range_min
+        self.range_max = range_max
+        self.header = FakeHeader(frame_id)
+
+
+class FakeVector3:
+    def __init__(self, x: float = 0.0, y: float = 0.0, z: float = 0.0) -> None:
+        self.x = x
+        self.y = y
+        self.z = z
+
+
+class FakeQuaternion:
+    def __init__(self, x: float = 0.0, y: float = 0.0, z: float = 0.0, w: float = 1.0) -> None:
+        self.x = x
+        self.y = y
+        self.z = z
+        self.w = w
+
+
+class FakeOdometry:
+    def __init__(self) -> None:
+        self.header = FakeHeader("odom")
+        self.child_frame_id = "base_link"
+        self.pose = types.SimpleNamespace(
+            pose=types.SimpleNamespace(
+                position=FakeVector3(1.25, -0.5, 0.0),
+                orientation=FakeQuaternion(0.0, 0.0, 0.0, 1.0),
+            )
+        )
+        self.twist = types.SimpleNamespace(
+            twist=types.SimpleNamespace(
+                linear=FakeVector3(0.12, 0.01, 0.0),
+                angular=FakeVector3(0.0, 0.0, -0.2),
+            )
+        )
+
+
 def _install_fake_ros2_modules() -> tuple[dict[str, object], types.ModuleType]:
     saved = {name: sys.modules.get(name) for name in ("rclpy", "geometry_msgs", "geometry_msgs.msg")}
     rclpy = types.ModuleType("rclpy")
@@ -145,6 +279,67 @@ def _install_failing_ros2_create_node_module() -> tuple[dict[str, object], types
         raise RuntimeError("probe node create failed")
 
     rclpy.create_node = create_node
+    return saved, rclpy
+
+
+def _install_fake_graph_ros2_modules(node: FakeRos2GraphNode) -> tuple[dict[str, object], types.ModuleType]:
+    saved = {
+        name: sys.modules.get(name)
+        for name in (
+            "rclpy",
+            "std_msgs",
+            "std_msgs.msg",
+            "sensor_msgs",
+            "sensor_msgs.msg",
+            "nav_msgs",
+            "nav_msgs.msg",
+        )
+    }
+    rclpy = types.ModuleType("rclpy")
+    rclpy.init_calls = 0
+    rclpy.created_nodes = []
+
+    def ok() -> bool:
+        return True
+
+    def init(args: object = None) -> None:
+        rclpy.init_calls += 1
+
+    def create_node(name: str) -> FakeRos2GraphNode:
+        node.name = name
+        rclpy.created_nodes.append(node)
+        return node
+
+    def spin_once(spin_node: FakeRos2GraphNode, timeout_sec: float = 0.0) -> None:
+        spin_node.spin_once()
+
+    rclpy.ok = ok
+    rclpy.init = init
+    rclpy.create_node = create_node
+    rclpy.spin_once = spin_once
+
+    std_msgs = types.ModuleType("std_msgs")
+    std_msgs_msg = types.ModuleType("std_msgs.msg")
+    std_msgs_msg.UInt16 = FakeUInt16
+    std_msgs.msg = std_msgs_msg
+
+    sensor_msgs = types.ModuleType("sensor_msgs")
+    sensor_msgs_msg = types.ModuleType("sensor_msgs.msg")
+    sensor_msgs_msg.LaserScan = FakeLaserScan
+    sensor_msgs.msg = sensor_msgs_msg
+
+    nav_msgs = types.ModuleType("nav_msgs")
+    nav_msgs_msg = types.ModuleType("nav_msgs.msg")
+    nav_msgs_msg.Odometry = FakeOdometry
+    nav_msgs.msg = nav_msgs_msg
+
+    sys.modules["rclpy"] = rclpy
+    sys.modules["std_msgs"] = std_msgs
+    sys.modules["std_msgs.msg"] = std_msgs_msg
+    sys.modules["sensor_msgs"] = sensor_msgs
+    sys.modules["sensor_msgs.msg"] = sensor_msgs_msg
+    sys.modules["nav_msgs"] = nav_msgs
+    sys.modules["nav_msgs.msg"] = nav_msgs_msg
     return saved, rclpy
 
 
@@ -1240,6 +1435,214 @@ def test_stage5_ros2_probe_destroy_failure_is_structured() -> dict:
     return result
 
 
+def test_stage8_graph_probe_module_import_is_inert() -> dict:
+    sys.modules.pop("miguel_core.miguel_hiwonder_ros2_graph_probe", None)
+    sys.modules.pop("rclpy", None)
+    sys.modules.pop("std_msgs", None)
+    sys.modules.pop("sensor_msgs", None)
+    sys.modules.pop("nav_msgs", None)
+    importlib.import_module("miguel_core.miguel_hiwonder_ros2_graph_probe")
+    assert "rclpy" not in sys.modules
+    assert "std_msgs" not in sys.modules
+    assert "sensor_msgs" not in sys.modules
+    assert "nav_msgs" not in sys.modules
+    return {"rclpy_imported": False, "message_packages_imported": False}
+
+
+def test_stage8_graph_probe_constructor_is_inert() -> dict:
+    sys.modules.pop("rclpy", None)
+    sys.modules.pop("std_msgs", None)
+    sys.modules.pop("sensor_msgs", None)
+    sys.modules.pop("nav_msgs", None)
+    probe = MiguelHiWonderRos2GraphProbe()
+    assert probe.node is None
+    assert probe.rclpy_module is None
+    assert "rclpy" not in sys.modules
+    assert "std_msgs" not in sys.modules
+    assert "sensor_msgs" not in sys.modules
+    assert "nav_msgs" not in sys.modules
+    return {"node": probe.node, "rclpy_module": probe.rclpy_module}
+
+
+def test_stage8_fake_node_list_and_topics_work() -> dict:
+    node = FakeRos2GraphNode(
+        nodes=["/controller", "/odom_publisher"],
+        topics=[
+            ("/controller/cmd_vel", ["geometry_msgs/msg/Twist"]),
+            ("/scan_raw", ["sensor_msgs/msg/LaserScan"]),
+        ],
+    )
+    probe = MiguelHiWonderRos2GraphProbe(node=node)
+    nodes = probe.list_nodes()
+    topics = probe.list_topics()
+    assert nodes["ok"] is True
+    assert "/controller" in nodes["nodes"]
+    assert topics["ok"] is True
+    assert topics["topics"]["/controller/cmd_vel"] == ["geometry_msgs/msg/Twist"]
+    return {"nodes": nodes, "topics": topics}
+
+
+def test_stage8_cmd_vel_without_competing_publishers_is_safe() -> dict:
+    node = FakeRos2GraphNode(
+        topics=[("/controller/cmd_vel", ["geometry_msgs/msg/Twist"])],
+        publisher_nodes_by_topic={"/controller/cmd_vel": ["miguel_hiwonder_ros2_adapter"]},
+        subscriber_nodes_by_topic={"/controller/cmd_vel": ["odom_publisher"]},
+    )
+    result = MiguelHiWonderRos2GraphProbe(node=node).inspect_cmd_vel()
+    assert result["topic_exists"] is True
+    assert result["message_type"] == "geometry_msgs/msg/Twist"
+    assert result["publisher_count"] == 1
+    assert result["subscription_count"] == 1
+    assert result["competing_publishers"] == []
+    assert result["safe_to_arm"] is True
+    assert result["movement_tested"] is False
+    assert result["hardware_verified"] is False
+    return result
+
+
+def test_stage8_cmd_vel_with_competing_publishers_is_unsafe() -> dict:
+    node = FakeRos2GraphNode(
+        topics=[("/controller/cmd_vel", ["geometry_msgs/msg/Twist"])],
+        publisher_nodes_by_topic={
+            "/controller/cmd_vel": [
+                "rosbridge_websocket",
+                "lidar_app",
+                "miguel_hiwonder_ros2_adapter",
+            ]
+        },
+        subscriber_nodes_by_topic={"/controller/cmd_vel": ["odom_publisher"]},
+    )
+    result = MiguelHiWonderRos2GraphProbe(node=node).inspect_cmd_vel()
+    assert result["safe_to_arm"] is False
+    assert result["competing_publishers"] == ["rosbridge_websocket", "lidar_app"]
+    assert result["publisher_count"] == 3
+    return result
+
+
+def test_stage8_battery_raw_maps_to_voltage() -> dict:
+    node = FakeRos2GraphNode(
+        messages_by_topic={
+            "/ros_robot_controller/battery": [FakeUInt16(7424)],
+        }
+    )
+    saved, _rclpy = _install_fake_graph_ros2_modules(node)
+    try:
+        result = MiguelHiWonderRos2GraphProbe().read_battery_once(timeout_sec=0.1)
+    finally:
+        _restore_modules(saved)
+    assert result["ok"] is True
+    assert result["readable"] is True
+    assert result["raw"] == 7424
+    assert result["estimated_voltage_v"] == 7.424
+    return result
+
+
+def test_stage8_lidar_summary_handles_nan_inf() -> dict:
+    ranges = [
+        1.0,
+        float("nan"),
+        float("inf"),
+        0.8,
+        0.5,
+        0.3,
+        2.0,
+    ]
+    scan = FakeLaserScan(
+        ranges=ranges,
+        angle_min=-math.pi / 2,
+        angle_increment=math.pi / 6,
+        range_min=0.05,
+        range_max=5.0,
+        frame_id="laser_frame",
+    )
+    node = FakeRos2GraphNode(messages_by_topic={"/scan_raw": [scan]})
+    saved, _rclpy = _install_fake_graph_ros2_modules(node)
+    try:
+        result = MiguelHiWonderRos2GraphProbe().read_lidar_once(timeout_sec=0.1)
+    finally:
+        _restore_modules(saved)
+    assert result["ok"] is True
+    assert result["valid_range_count"] == 5
+    assert result["nearest_obstacle_cm"] == 30.0
+    assert result["front_clearance_cm"] == 80.0
+    assert result["left_clearance_cm"] == 200.0
+    assert result["right_clearance_cm"] == 100.0
+    assert result["frame_id"] == "laser_frame"
+    return result
+
+
+def test_stage8_odom_summary_handles_minimal_fake_odometry() -> dict:
+    node = FakeRos2GraphNode(messages_by_topic={"/odom": [FakeOdometry()]})
+    saved, _rclpy = _install_fake_graph_ros2_modules(node)
+    try:
+        result = MiguelHiWonderRos2GraphProbe().read_odom_once(timeout_sec=0.1)
+    finally:
+        _restore_modules(saved)
+    assert result["ok"] is True
+    assert result["x"] == 1.25
+    assert result["y"] == -0.5
+    assert result["yaw_approx"] == 0.0
+    assert result["linear_x"] == 0.12
+    assert result["linear_y"] == 0.01
+    assert result["angular_z"] == -0.2
+    assert result["frame_id"] == "odom"
+    assert result["child_frame_id"] == "base_link"
+    return result
+
+
+def test_stage8_sensor_failure_returns_structured_error() -> dict:
+    node = FakeRos2GraphNode()
+    saved, _rclpy = _install_fake_graph_ros2_modules(node)
+    try:
+        result = MiguelHiWonderRos2GraphProbe().read_battery_once(timeout_sec=0.0)
+    finally:
+        _restore_modules(saved)
+    assert result["ok"] is False
+    assert result["readable"] is False
+    assert result["sensor"] == "battery"
+    assert result["reason"] == "timeout"
+    return result
+
+
+def test_stage8_readiness_report_combines_graph_and_sensors() -> dict:
+    node = FakeRos2GraphNode(
+        nodes=["/controller", "/odom_publisher"],
+        topics=[
+            ("/controller/cmd_vel", ["geometry_msgs/msg/Twist"]),
+            ("/ros_robot_controller/battery", ["std_msgs/msg/UInt16"]),
+            ("/scan_raw", ["sensor_msgs/msg/LaserScan"]),
+            ("/odom", ["nav_msgs/msg/Odometry"]),
+        ],
+        publisher_nodes_by_topic={"/controller/cmd_vel": ["lidar_app"]},
+        subscriber_nodes_by_topic={"/controller/cmd_vel": ["odom_publisher"]},
+        messages_by_topic={
+            "/ros_robot_controller/battery": [FakeUInt16(7424)],
+            "/scan_raw": [
+                FakeLaserScan([1.0, 0.75, 1.5], angle_min=-0.1, angle_increment=0.1)
+            ],
+            "/odom": [FakeOdometry()],
+        },
+    )
+    saved, _rclpy = _install_fake_graph_ros2_modules(node)
+    try:
+        result = MiguelHiWonderRos2GraphProbe().build_readiness_report()
+    finally:
+        _restore_modules(saved)
+    assert result["ros2_available"] is True
+    assert result["car_graph_visible"] is True
+    assert result["cmd_vel_safe_to_arm"] is False
+    assert result["competing_cmd_vel_publishers"] == ["lidar_app"]
+    assert result["battery_ok"] is True
+    assert result["battery_readable"] is True
+    assert result["lidar_ok"] is True
+    assert result["lidar_readable"] is True
+    assert result["odom_ok"] is True
+    assert result["odom_readable"] is True
+    assert result["movement_tested"] is False
+    assert result["hardware_verified"] is False
+    return result
+
+
 def main() -> None:
     result = test_explore_room_turn_right_allowed()
     test_unsafe_move_forward_blocked()
@@ -1326,6 +1729,16 @@ def main() -> None:
     test_stage5_ros2_probe_readiness_never_tests_movement()
     test_stage5_ros2_probe_node_creation_failure_is_structured()
     test_stage5_ros2_probe_destroy_failure_is_structured()
+    test_stage8_graph_probe_module_import_is_inert()
+    test_stage8_graph_probe_constructor_is_inert()
+    test_stage8_fake_node_list_and_topics_work()
+    test_stage8_cmd_vel_without_competing_publishers_is_safe()
+    test_stage8_cmd_vel_with_competing_publishers_is_unsafe()
+    test_stage8_battery_raw_maps_to_voltage()
+    test_stage8_lidar_summary_handles_nan_inf()
+    test_stage8_odom_summary_handles_minimal_fake_odometry()
+    test_stage8_sensor_failure_returns_structured_error()
+    test_stage8_readiness_report_combines_graph_and_sensors()
 
     print("\nTelemetry:")
     pprint(result["telemetry"])
