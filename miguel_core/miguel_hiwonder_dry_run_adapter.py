@@ -140,7 +140,7 @@ class MiguelHiWonderDryRunAdapter(MiguelHiWonderAdapterBase):
             result = self.set_velocity(
                 command,
                 str(params.get("speed") or "slow"),
-                float(params.get("duration_sec") or 0.0),
+                params.get("duration_sec") or 0.0,
             )
         elif command == "stop":
             result = self.stop(str(params.get("reason") or "requested"))

@@ -24,21 +24,25 @@ class MiguelRobotBus:
         command: str,
         params: dict | None = None,
         safety: dict | None = None,
+        status: str = "accepted",
+        adapter_result: dict | None = None,
     ) -> dict:
         safety_payload = safety or {}
-        event = self._build_event(
-            "command",
-            {
-                "target": target,
-                "command": command,
-                "params": params or {},
-                "safety": safety_payload,
-                "safety_allowed": safety_payload.get("ok"),
-                "safety_blocked": safety_payload.get("blocked"),
-                "simulated": True,
-                "status": "accepted",
-            },
-        )
+        payload = {
+            "target": target,
+            "command": command,
+            "params": params or {},
+            "safety": safety_payload,
+            "safety_allowed": safety_payload.get("ok"),
+            "safety_blocked": safety_payload.get("blocked"),
+            "simulated": True,
+            "status": status,
+        }
+        if adapter_result is not None:
+            payload["adapter_result"] = adapter_result
+            payload["adapter_blocked"] = adapter_result.get("blocked")
+            payload["adapter_reason"] = adapter_result.get("reason")
+        event = self._build_event("command", payload)
         self._append_event(event)
         print(f"[MIGUEL_ROBOT_BUS] command target={target} command={command}")
         return event

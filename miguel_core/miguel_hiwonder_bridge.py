@@ -132,14 +132,18 @@ class MiguelHiWonderBridge:
         params = validation["adjusted_params"]
         print(f"[MIGUEL_HIWONDER] {command} speed={params['speed']} duration_sec={params['duration_sec']}")
         safety_payload = self._safety_payload(validation)
+        adapter_result = self.adapter.set_velocity(command, params["speed"], params["duration_sec"])
+        status = "blocked" if adapter_result.get("blocked") else "accepted"
         result = self.robot_bus.send_command(
             self.TARGET,
             command,
             params,
             safety_payload,
+            status=status,
+            adapter_result=adapter_result,
         )
         result["safety_validation"] = validation
-        result["adapter_result"] = self.adapter.set_velocity(command, params["speed"], params["duration_sec"])
+        result["adapter_result"] = adapter_result
         return result
 
     def _safety_payload(self, validation: dict) -> dict:

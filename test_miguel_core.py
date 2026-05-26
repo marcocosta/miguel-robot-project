@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pprint import pprint
 from tempfile import TemporaryDirectory
 
@@ -119,6 +120,8 @@ def test_default_bridge_uses_dry_run_adapter() -> dict:
 
 
 def test_probe_runs_without_crashing() -> dict:
+    if os.environ.get("MIGUEL_RUN_REAL_PROBE") != "1":
+        return {"skipped": True, "reason": "set MIGUEL_RUN_REAL_PROBE=1 to run host probe"}
     result = MiguelHiWonderRealProbe().probe()
     assert result["ok"] is True
     assert "likely_interfaces" in result
@@ -206,6 +209,94 @@ def test_stage1_adapter_speed_cap() -> dict:
     return result
 
 
+def test_stage1_mission_disarmed_records_blocked_not_accepted() -> dict:
+    runtime = _runtime()
+    _set_telemetry(runtime)
+    result = runtime.run_hiwonder_mission_step("explore_room")
+    command_result = result["command_result"]
+    assert command_result["payload"]["command"] == "move_forward"
+    assert command_result["payload"]["status"] == "blocked"
+    assert command_result["payload"]["adapter_blocked"] is True
+    assert command_result["adapter_result"]["reason"] == "adapter_disarmed"
+    runtime.shutdown()
+    return result
+
+
+def test_stage1_move_backward_twist_sign() -> dict:
+    adapter = MiguelHiWonderDryRunAdapter()
+    adapter.arm()
+    result = adapter.set_velocity("move_backward", "slow", 1.0)
+    assert result["twist"]["linear_x"] < 0
+    assert result["twist"]["angular_z"] == 0.0
+    return result
+
+
+def test_stage1_turn_left_twist_sign() -> dict:
+    adapter = MiguelHiWonderDryRunAdapter()
+    adapter.arm()
+    result = adapter.set_velocity("turn_left", "slow", 1.0)
+    assert result["twist"]["linear_x"] == 0.0
+    assert result["twist"]["angular_z"] > 0
+    return result
+
+
+def test_stage1_turn_right_twist_sign() -> dict:
+    adapter = MiguelHiWonderDryRunAdapter()
+    adapter.arm()
+    result = adapter.set_velocity("turn_right", "slow", 1.0)
+    assert result["twist"]["linear_x"] == 0.0
+    assert result["twist"]["angular_z"] < 0
+    return result
+
+
+def test_stage1_negative_duration_clamps_to_zero() -> dict:
+    adapter = MiguelHiWonderDryRunAdapter()
+    adapter.arm()
+    result = adapter.set_velocity("move_forward", "slow", -2.0)
+    assert result["params"]["duration_sec"] == 0.0
+    return result
+
+
+def test_stage1_nonnumeric_duration_clamps_to_zero() -> dict:
+    adapter = MiguelHiWonderDryRunAdapter()
+    adapter.arm()
+    result = adapter.set_velocity("move_forward", "slow", "not-a-number")
+    assert result["params"]["duration_sec"] == 0.0
+    return result
+
+
+def test_stage1_close_disarms_and_records_stop() -> dict:
+    adapter = MiguelHiWonderDryRunAdapter()
+    adapter.arm()
+    adapter.close()
+    assert adapter.armed is False
+    assert adapter.command_log[-1]["command"] == "stop"
+    assert adapter.command_log[-1]["params"]["reason"] == "adapter close"
+    return adapter.command_log[-1]
+
+
+def test_stage1_low_battery_blocks_movement() -> dict:
+    runtime = _runtime()
+    runtime.hiwonder.arm()
+    _set_telemetry(runtime, battery_percent=10)
+    result = runtime.hiwonder.move_forward()
+    assert result["payload"]["command"] == "stop"
+    assert result["safety_validation"]["reason"] == "battery_below_minimum"
+    runtime.shutdown()
+    return result
+
+
+def test_stage1_nearest_obstacle_blocks_movement() -> dict:
+    runtime = _runtime()
+    runtime.hiwonder.arm()
+    _set_telemetry(runtime, nearest_obstacle_cm=20)
+    result = runtime.hiwonder.turn_left()
+    assert result["payload"]["command"] == "stop"
+    assert result["safety_validation"]["reason"] == "nearest_obstacle_too_close"
+    runtime.shutdown()
+    return result
+
+
 def main() -> None:
     result = test_explore_room_turn_right_allowed()
     test_unsafe_move_forward_blocked()
@@ -223,6 +314,15 @@ def main() -> None:
     test_stage1_emergency_stop_records_stop()
     test_stage1_adapter_duration_cap()
     test_stage1_adapter_speed_cap()
+    test_stage1_mission_disarmed_records_blocked_not_accepted()
+    test_stage1_move_backward_twist_sign()
+    test_stage1_turn_left_twist_sign()
+    test_stage1_turn_right_twist_sign()
+    test_stage1_negative_duration_clamps_to_zero()
+    test_stage1_nonnumeric_duration_clamps_to_zero()
+    test_stage1_close_disarms_and_records_stop()
+    test_stage1_low_battery_blocks_movement()
+    test_stage1_nearest_obstacle_blocks_movement()
 
     print("\nTelemetry:")
     pprint(result["telemetry"])
