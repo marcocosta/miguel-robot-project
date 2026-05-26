@@ -49,12 +49,27 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
         # Stage 3 deliberately does not create ROS2 nodes/publishers. Future
         # hardware smoke-test stages can add a guarded implementation here.
         self.available = publisher is not None
+        self.backend = "injected_publisher" if publisher is not None else "unavailable"
+        self.real_ros2_enabled = False
+        self.hardware_verified = False
+        self.unavailable_reason = "real_ros2_not_implemented" if allow_real_ros2 else "adapter_unavailable"
 
     def get_name(self) -> str:
         return "ros2"
 
     def is_real_hardware(self) -> bool:
-        return self.available and not self._uses_dict_payloads()
+        return self.hardware_verified
+
+    def backend_status(self) -> dict:
+        return {
+            "adapter": self.get_name(),
+            "backend": self.backend,
+            "available": self.available,
+            "real_ros2_enabled": self.real_ros2_enabled,
+            "hardware_verified": self.hardware_verified,
+            "allow_real_ros2": self.allow_real_ros2,
+            "reason": "ok" if self.available else self.unavailable_reason,
+        }
 
     def arm(self) -> dict:
         if not self.available:
@@ -78,9 +93,25 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
         return result
 
     def stop(self, reason: str | None = None) -> dict:
-        payload = self._twist_payload(0.0, 0.0, 0.0, 0.0)
         if not self.available:
+            payload = self._plain_twist_payload(0.0, 0.0, 0.0, 0.0)
             return self._unavailable("stop", params={"reason": reason or "requested"}, payload=payload)
+
+        twist_result = self._twist_payload(0.0, 0.0, 0.0, 0.0)
+        payload = twist_result.get("payload")
+        if not twist_result["ok"]:
+            return self._record(
+                "stop",
+                ok=False,
+                blocked=True,
+                error=True,
+                reason=twist_result["reason"],
+                params={
+                    "reason": reason or "requested",
+                    "error": twist_result["error"],
+                },
+                payload=payload,
+            )
 
         publish_result = self._publish(payload)
         if not publish_result["ok"]:
@@ -89,7 +120,7 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
                 ok=False,
                 blocked=True,
                 error=True,
-                reason="publisher_error",
+                reason=publish_result["reason"],
                 params={
                     "reason": reason or "requested",
                     "error": publish_result["error"],
@@ -122,12 +153,26 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
             )
 
         duration = self._cap_number(duration_sec, 0.0, self.MAX_DURATION_SEC)
-        payload = self._twist_payload(
+        twist_result = self._twist_payload(
             self._cap_number(linear_x, -self.MAX_LINEAR_X, self.MAX_LINEAR_X),
             self._cap_number(linear_y, -self.MAX_LINEAR_Y, self.MAX_LINEAR_Y),
             self._cap_number(angular_z, -self.MAX_ANGULAR_Z, self.MAX_ANGULAR_Z),
             duration,
         )
+        payload = twist_result.get("payload")
+        if not twist_result["ok"]:
+            return self._record(
+                "drive_twist",
+                ok=False,
+                blocked=True,
+                error=True,
+                reason=twist_result["reason"],
+                params={
+                    "duration_sec": duration,
+                    "error": twist_result["error"],
+                },
+                payload=payload,
+            )
         publish_result = self._publish(payload)
         if not publish_result["ok"]:
             return self._record(
@@ -135,7 +180,7 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
                 ok=False,
                 blocked=True,
                 error=True,
-                reason="publisher_error",
+                reason=publish_result["reason"],
                 params={
                     "duration_sec": duration,
                     "error": publish_result["error"],
@@ -255,9 +300,10 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
         self._latest_telemetry = telemetry_record
         return dict(telemetry_record)
 
-    def close(self) -> None:
-        self.stop("adapter close")
+    def close(self) -> dict:
+        result = self.stop("adapter close")
         self.armed = False
+        return result
 
     def _unavailable(
         self,
@@ -269,7 +315,7 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
             command,
             ok=False,
             blocked=True,
-            reason="adapter_unavailable",
+            reason=self.unavailable_reason,
             params=params or {"allow_real_ros2": self.allow_real_ros2},
             payload=payload,
         )
@@ -283,20 +329,43 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
             elif hasattr(self.publisher, "publish"):
                 self.publisher.publish(payload)
             else:
-                raise TypeError("publisher must expose publish(payload) or publish_twist(payload)")
+                return {
+                    "ok": False,
+                    "reason": "publisher_unavailable",
+                    "error": "publisher must expose publish(payload) or publish_twist(payload)",
+                }
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
-        return {"ok": True, "error": None}
+            return {"ok": False, "reason": "publisher_error", "error": str(exc)}
+        return {"ok": True, "reason": "ok", "error": None}
 
-    def _twist_payload(self, linear_x: float, linear_y: float, angular_z: float, duration_sec: float) -> object:
+    def _twist_payload(self, linear_x: float, linear_y: float, angular_z: float, duration_sec: float) -> dict:
         if self.twist_factory is not None:
-            return self.twist_factory(
-                linear_x=linear_x,
-                linear_y=linear_y,
-                angular_z=angular_z,
-                duration_sec=duration_sec,
-                topic=self.topic,
-            )
+            try:
+                payload = self.twist_factory(
+                    linear_x=linear_x,
+                    linear_y=linear_y,
+                    angular_z=angular_z,
+                    duration_sec=duration_sec,
+                    topic=self.topic,
+                )
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "reason": "twist_factory_error",
+                    "error": str(exc),
+                    "payload": None,
+                }
+            return {"ok": True, "reason": "ok", "error": None, "payload": payload}
+        payload = self._plain_twist_payload(linear_x, linear_y, angular_z, duration_sec)
+        return {"ok": True, "reason": "ok", "error": None, "payload": payload}
+
+    def _plain_twist_payload(
+        self,
+        linear_x: float,
+        linear_y: float,
+        angular_z: float,
+        duration_sec: float,
+    ) -> dict:
         return {
             "topic": self.topic,
             "linear": {"x": linear_x, "y": linear_y, "z": 0.0},
@@ -330,6 +399,9 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
             "adapter": self.get_name(),
             "armed": self.armed,
             "available": self.available,
+            "backend": self.backend,
+            "real_ros2_enabled": self.real_ros2_enabled,
+            "hardware_verified": self.hardware_verified,
             "command": command,
             "params": params or {},
             "payload": payload,

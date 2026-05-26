@@ -40,6 +40,26 @@ class FailingTwistPublisher:
         raise RuntimeError("fake publisher failed")
 
 
+class MissingPublishTwistPublisher:
+    pass
+
+
+class FailsOnSecondPublishPublisher:
+    def __init__(self) -> None:
+        self.payloads: list[dict] = []
+        self.calls = 0
+
+    def publish(self, payload: dict) -> None:
+        self.calls += 1
+        if self.calls == 2:
+            raise RuntimeError("followup stop failed")
+        self.payloads.append(dict(payload))
+
+
+def failing_twist_factory(**kwargs: object) -> dict:
+    raise RuntimeError("twist factory failed")
+
+
 def _runtime() -> MiguelRuntime:
     temp_dir = TemporaryDirectory()
     runtime = MiguelRuntime(temp_dir.name)
@@ -741,6 +761,148 @@ def test_stage3_bridge_accepts_injected_ros2_adapter() -> dict:
     return result
 
 
+def test_stage31_ros2_injected_publisher_is_not_real_hardware() -> dict:
+    publisher = FakeTwistPublisher()
+    adapter = MiguelHiWonderRos2Adapter(
+        publisher=publisher,
+        twist_factory=lambda **kwargs: dict(kwargs),
+    )
+    status = adapter.backend_status()
+    assert adapter.is_real_hardware() is False
+    assert status["adapter"] == "ros2"
+    assert status["backend"] == "injected_publisher"
+    assert status["real_ros2_enabled"] is False
+    assert status["hardware_verified"] is False
+    return status
+
+
+def test_stage31_ros2_allow_real_without_publisher_is_not_implemented() -> dict:
+    adapter = MiguelHiWonderRos2Adapter(allow_real_ros2=True)
+    status = adapter.backend_status()
+    result = adapter.set_velocity("move_forward", "slow", 1.0)
+    assert status["available"] is False
+    assert status["real_ros2_enabled"] is False
+    assert status["hardware_verified"] is False
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert result["reason"] == "real_ros2_not_implemented"
+    return result
+
+
+def test_stage31_ros2_twist_factory_failure_on_movement_is_structured() -> dict:
+    publisher = FakeTwistPublisher()
+    adapter = MiguelHiWonderRos2Adapter(publisher=publisher, twist_factory=failing_twist_factory)
+    adapter.arm()
+    result = adapter.set_velocity("move_forward", "slow", 1.0)
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert result["error"] is True
+    assert result["reason"] == "twist_factory_error"
+    assert publisher.payloads == []
+    return result
+
+
+def test_stage31_ros2_twist_factory_failure_on_stop_is_structured() -> dict:
+    publisher = FakeTwistPublisher()
+    adapter = MiguelHiWonderRos2Adapter(publisher=publisher, twist_factory=failing_twist_factory)
+    result = adapter.stop("factory failure")
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert result["error"] is True
+    assert result["reason"] == "twist_factory_error"
+    assert publisher.payloads == []
+    return result
+
+
+def test_stage31_ros2_twist_factory_failure_on_disarm_is_structured() -> dict:
+    publisher = FakeTwistPublisher()
+    adapter = MiguelHiWonderRos2Adapter(publisher=publisher, twist_factory=failing_twist_factory)
+    adapter.arm()
+    result = adapter.disarm()
+    assert adapter.armed is False
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert result["error"] is True
+    assert result["reason"] == "twist_factory_error"
+    assert publisher.payloads == []
+    return result
+
+
+def test_stage31_ros2_twist_factory_failure_on_close_is_structured() -> dict:
+    publisher = FakeTwistPublisher()
+    adapter = MiguelHiWonderRos2Adapter(publisher=publisher, twist_factory=failing_twist_factory)
+    adapter.arm()
+    result = adapter.close()
+    assert adapter.armed is False
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert result["error"] is True
+    assert result["reason"] == "twist_factory_error"
+    assert publisher.payloads == []
+    return result
+
+
+def test_stage31_ros2_unknown_command_blocks_without_publish() -> dict:
+    publisher = FakeTwistPublisher()
+    adapter = MiguelHiWonderRos2Adapter(publisher=publisher)
+    adapter.arm()
+    result = adapter.set_velocity("spin", "slow", 1.0)
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert result["reason"] == "unknown_movement_command"
+    assert publisher.payloads == []
+    return result
+
+
+def test_stage31_ros2_missing_publish_method_is_structured() -> dict:
+    adapter = MiguelHiWonderRos2Adapter(publisher=MissingPublishTwistPublisher())
+    result = adapter.stop("missing publisher method")
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert result["error"] is True
+    assert result["reason"] == "publisher_unavailable"
+    return result
+
+
+def test_stage31_ros2_followup_stop_failure_preserves_movement_result() -> dict:
+    publisher = FailsOnSecondPublishPublisher()
+    adapter = MiguelHiWonderRos2Adapter(publisher=publisher)
+    adapter.arm()
+    result = adapter.set_velocity("move_forward", "slow", 1.0)
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert result["error"] is True
+    assert result["reason"] == "publisher_error"
+    assert result["payload"]["linear"]["x"] > 0
+    assert result["followup_stop"]["command"] == "stop"
+    assert result["followup_stop"]["reason"] == "publisher_error"
+    assert len(publisher.payloads) == 1
+    return result
+
+
+def test_stage31_ros2_no_publisher_disarm_is_unavailable() -> dict:
+    adapter = MiguelHiWonderRos2Adapter()
+    adapter.armed = True
+    result = adapter.disarm()
+    assert adapter.armed is False
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert result["reason"] == "adapter_unavailable"
+    assert result["stop_result"]["command"] == "stop"
+    return result
+
+
+def test_stage31_ros2_no_publisher_close_is_unavailable() -> dict:
+    adapter = MiguelHiWonderRos2Adapter()
+    adapter.armed = True
+    result = adapter.close()
+    assert adapter.armed is False
+    assert result["ok"] is False
+    assert result["blocked"] is True
+    assert result["reason"] == "adapter_unavailable"
+    return result
+
+
 def main() -> None:
     result = test_explore_room_turn_right_allowed()
     test_unsafe_move_forward_blocked()
@@ -802,6 +964,17 @@ def main() -> None:
     test_stage3_ros2_negative_duration_clamps_to_zero()
     test_stage3_ros2_nonnumeric_duration_clamps_to_zero()
     test_stage3_bridge_accepts_injected_ros2_adapter()
+    test_stage31_ros2_injected_publisher_is_not_real_hardware()
+    test_stage31_ros2_allow_real_without_publisher_is_not_implemented()
+    test_stage31_ros2_twist_factory_failure_on_movement_is_structured()
+    test_stage31_ros2_twist_factory_failure_on_stop_is_structured()
+    test_stage31_ros2_twist_factory_failure_on_disarm_is_structured()
+    test_stage31_ros2_twist_factory_failure_on_close_is_structured()
+    test_stage31_ros2_unknown_command_blocks_without_publish()
+    test_stage31_ros2_missing_publish_method_is_structured()
+    test_stage31_ros2_followup_stop_failure_preserves_movement_result()
+    test_stage31_ros2_no_publisher_disarm_is_unavailable()
+    test_stage31_ros2_no_publisher_close_is_unavailable()
 
     print("\nTelemetry:")
     pprint(result["telemetry"])
