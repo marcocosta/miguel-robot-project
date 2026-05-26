@@ -1,12 +1,13 @@
-"""Guarded ROS2 HiWonder adapter skeleton for Miguel.
+"""Guarded ROS2 HiWonder adapter for Miguel.
 
 This module intentionally avoids importing ROS2 packages at import time. The
-Stage 3 adapter only publishes through explicitly injected test doubles or
-future Miguel-owned ROS2 objects.
+adapter publishes through injected test doubles by default, or through a real
+ROS2 publisher only when explicitly constructed with allow_real_ros2=True.
 """
 
 from __future__ import annotations
 
+import importlib
 from datetime import datetime, timezone
 from itertools import count
 from typing import Callable
@@ -45,14 +46,18 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
         self.command_log: list[dict] = []
         self._latest_telemetry: dict | None = None
         self._ids = count(1)
+        self._twist_class: object | None = None
+        self._owned_node = False
 
-        # Stage 3 deliberately does not create ROS2 nodes/publishers. Future
-        # hardware smoke-test stages can add a guarded implementation here.
         self.available = publisher is not None
         self.backend = "injected_publisher" if publisher is not None else "unavailable"
         self.real_ros2_enabled = False
         self.hardware_verified = False
-        self.unavailable_reason = "real_ros2_not_implemented" if allow_real_ros2 else "adapter_unavailable"
+        self.unavailable_reason = "adapter_unavailable"
+        self.init_error: str | None = None
+
+        if publisher is None and allow_real_ros2:
+            self._initialize_real_ros2()
 
     def get_name(self) -> str:
         return "ros2"
@@ -69,6 +74,7 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
             "hardware_verified": self.hardware_verified,
             "allow_real_ros2": self.allow_real_ros2,
             "reason": "ok" if self.available else self.unavailable_reason,
+            "init_error": self.init_error,
         }
 
     def arm(self) -> dict:
@@ -303,7 +309,48 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
     def close(self) -> dict:
         result = self.stop("adapter close")
         self.armed = False
+        if self._owned_node and self.node is not None and hasattr(self.node, "destroy_node"):
+            try:
+                self.node.destroy_node()
+            except Exception as exc:
+                result["node_destroy_error"] = str(exc)
+            finally:
+                self._owned_node = False
         return result
+
+    def _initialize_real_ros2(self) -> None:
+        try:
+            rclpy = importlib.import_module("rclpy")
+            geometry_msgs_msg = importlib.import_module("geometry_msgs.msg")
+            twist_class = getattr(geometry_msgs_msg, "Twist")
+        except Exception as exc:
+            self.unavailable_reason = "ros2_dependency_unavailable"
+            self.init_error = str(exc)
+            return
+
+        try:
+            node = self.node
+            if node is None:
+                if not hasattr(rclpy, "ok") or not rclpy.ok():
+                    rclpy.init(args=None)
+                node = rclpy.create_node("miguel_hiwonder_ros2_adapter")
+                self._owned_node = True
+            publisher = node.create_publisher(twist_class, self.topic, 10)
+        except Exception as exc:
+            self.unavailable_reason = "ros2_init_error"
+            self.init_error = str(exc)
+            self._owned_node = False
+            return
+
+        self.node = node
+        self.publisher = publisher
+        self._twist_class = twist_class
+        self.available = True
+        self.backend = "real_ros2"
+        self.real_ros2_enabled = True
+        self.hardware_verified = False
+        self.unavailable_reason = "ok"
+        self.init_error = None
 
     def _unavailable(
         self,
@@ -348,6 +395,23 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
                     duration_sec=duration_sec,
                     topic=self.topic,
                 )
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "reason": "twist_factory_error",
+                    "error": str(exc),
+                    "payload": None,
+                }
+            return {"ok": True, "reason": "ok", "error": None, "payload": payload}
+        if self.real_ros2_enabled and self._twist_class is not None:
+            try:
+                payload = self._twist_class()
+                payload.linear.x = linear_x
+                payload.linear.y = linear_y
+                payload.linear.z = 0.0
+                payload.angular.x = 0.0
+                payload.angular.y = 0.0
+                payload.angular.z = angular_z
             except Exception as exc:
                 return {
                     "ok": False,

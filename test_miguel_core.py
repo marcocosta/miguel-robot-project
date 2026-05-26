@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import importlib
 import sys
+import types
 from pprint import pprint
 from tempfile import TemporaryDirectory
 
@@ -58,6 +59,85 @@ class FailsOnSecondPublishPublisher:
 
 def failing_twist_factory(**kwargs: object) -> dict:
     raise RuntimeError("twist factory failed")
+
+
+class FakeRos2Vector:
+    def __init__(self) -> None:
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+
+
+class FakeRos2Twist:
+    def __init__(self) -> None:
+        self.linear = FakeRos2Vector()
+        self.angular = FakeRos2Vector()
+
+
+class FakeRos2Publisher:
+    def __init__(self) -> None:
+        self.messages: list[FakeRos2Twist] = []
+
+    def publish(self, message: FakeRos2Twist) -> None:
+        self.messages.append(message)
+
+
+class FakeRos2Node:
+    def __init__(self) -> None:
+        self.publishers: list[FakeRos2Publisher] = []
+        self.destroyed = False
+
+    def create_publisher(self, message_type: object, topic: str, depth: int) -> FakeRos2Publisher:
+        publisher = FakeRos2Publisher()
+        publisher.message_type = message_type
+        publisher.topic = topic
+        publisher.depth = depth
+        self.publishers.append(publisher)
+        return publisher
+
+    def destroy_node(self) -> None:
+        self.destroyed = True
+
+
+def _install_fake_ros2_modules() -> tuple[dict[str, object], types.ModuleType]:
+    saved = {name: sys.modules.get(name) for name in ("rclpy", "geometry_msgs", "geometry_msgs.msg")}
+    rclpy = types.ModuleType("rclpy")
+    rclpy.init_calls = 0
+    rclpy.created_nodes = []
+
+    def ok() -> bool:
+        return False
+
+    def init(args: object = None) -> None:
+        rclpy.init_calls += 1
+
+    def create_node(name: str) -> FakeRos2Node:
+        node = FakeRos2Node()
+        node.name = name
+        rclpy.created_nodes.append(node)
+        return node
+
+    rclpy.ok = ok
+    rclpy.init = init
+    rclpy.create_node = create_node
+
+    geometry_msgs = types.ModuleType("geometry_msgs")
+    geometry_msgs_msg = types.ModuleType("geometry_msgs.msg")
+    geometry_msgs_msg.Twist = FakeRos2Twist
+    geometry_msgs.msg = geometry_msgs_msg
+
+    sys.modules["rclpy"] = rclpy
+    sys.modules["geometry_msgs"] = geometry_msgs
+    sys.modules["geometry_msgs.msg"] = geometry_msgs_msg
+    return saved, rclpy
+
+
+def _restore_modules(saved: dict[str, object]) -> None:
+    for name, module in saved.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
 
 
 def _runtime() -> MiguelRuntime:
@@ -785,7 +865,7 @@ def test_stage31_ros2_allow_real_without_publisher_is_not_implemented() -> dict:
     assert status["hardware_verified"] is False
     assert result["ok"] is False
     assert result["blocked"] is True
-    assert result["reason"] == "real_ros2_not_implemented"
+    assert result["reason"] in {"ros2_dependency_unavailable", "ros2_init_error"}
     return result
 
 
@@ -903,6 +983,104 @@ def test_stage31_ros2_no_publisher_close_is_unavailable() -> dict:
     return result
 
 
+def test_stage4_allow_real_ros2_missing_dependencies_is_structured() -> dict:
+    import miguel_core.miguel_hiwonder_ros2_adapter as ros2_module
+
+    original_import_module = ros2_module.importlib.import_module
+
+    def missing_ros_import(name: str, *args: object, **kwargs: object) -> object:
+        if name in {"rclpy", "geometry_msgs.msg"}:
+            raise ImportError(f"{name} unavailable for test")
+        return original_import_module(name, *args, **kwargs)
+
+    ros2_module.importlib.import_module = missing_ros_import
+    try:
+        adapter = MiguelHiWonderRos2Adapter(allow_real_ros2=True)
+    finally:
+        ros2_module.importlib.import_module = original_import_module
+
+    status = adapter.backend_status()
+    assert status["available"] is False
+    assert status["backend"] == "unavailable"
+    assert status["real_ros2_enabled"] is False
+    assert status["reason"] == "ros2_dependency_unavailable"
+    result = adapter.stop("missing deps")
+    assert result["reason"] == "ros2_dependency_unavailable"
+    return result
+
+
+def test_stage4_fake_real_ros2_backend_constructs_without_publish() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        adapter = MiguelHiWonderRos2Adapter(allow_real_ros2=True)
+        status = adapter.backend_status()
+        assert status["available"] is True
+        assert status["backend"] == "real_ros2"
+        assert status["real_ros2_enabled"] is True
+        assert status["hardware_verified"] is False
+        assert len(rclpy.created_nodes) == 1
+        assert rclpy.created_nodes[0].name == "miguel_hiwonder_ros2_adapter"
+        assert len(rclpy.created_nodes[0].publishers) == 1
+        assert rclpy.created_nodes[0].publishers[0].messages == []
+        return status
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage4_fake_real_ros2_stop_publishes_zero_twist() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        adapter = MiguelHiWonderRos2Adapter(allow_real_ros2=True)
+        result = adapter.stop("manual stop")
+        publisher = rclpy.created_nodes[0].publishers[0]
+        assert result["ok"] is True
+        assert len(publisher.messages) == 1
+        message = publisher.messages[0]
+        assert isinstance(message, FakeRos2Twist)
+        assert message.linear.x == 0.0
+        assert message.linear.y == 0.0
+        assert message.angular.z == 0.0
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage4_fake_real_ros2_arm_move_forward_publishes_twist_and_stop() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        adapter = MiguelHiWonderRos2Adapter(allow_real_ros2=True)
+        adapter.arm()
+        result = adapter.set_velocity("move_forward", "slow", 1.0)
+        publisher = rclpy.created_nodes[0].publishers[0]
+        assert result["ok"] is True
+        assert len(publisher.messages) == 2
+        move_message, stop_message = publisher.messages
+        assert 0 < move_message.linear.x <= adapter.MAX_LINEAR_X
+        assert move_message.linear.y == 0.0
+        assert move_message.angular.z == 0.0
+        assert stop_message.linear.x == 0.0
+        assert stop_message.linear.y == 0.0
+        assert stop_message.angular.z == 0.0
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage4_fake_real_ros2_close_destroys_owned_node() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        adapter = MiguelHiWonderRos2Adapter(allow_real_ros2=True)
+        node = rclpy.created_nodes[0]
+        adapter.arm()
+        result = adapter.close()
+        assert adapter.armed is False
+        assert node.destroyed is True
+        assert node.publishers[0].messages[-1].linear.x == 0.0
+        return result
+    finally:
+        _restore_modules(saved)
+
+
 def main() -> None:
     result = test_explore_room_turn_right_allowed()
     test_unsafe_move_forward_blocked()
@@ -975,6 +1153,11 @@ def main() -> None:
     test_stage31_ros2_followup_stop_failure_preserves_movement_result()
     test_stage31_ros2_no_publisher_disarm_is_unavailable()
     test_stage31_ros2_no_publisher_close_is_unavailable()
+    test_stage4_allow_real_ros2_missing_dependencies_is_structured()
+    test_stage4_fake_real_ros2_backend_constructs_without_publish()
+    test_stage4_fake_real_ros2_stop_publishes_zero_twist()
+    test_stage4_fake_real_ros2_arm_move_forward_publishes_twist_and_stop()
+    test_stage4_fake_real_ros2_close_destroys_owned_node()
 
     print("\nTelemetry:")
     pprint(result["telemetry"])
