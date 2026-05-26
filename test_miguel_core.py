@@ -15,6 +15,7 @@ from miguel_core import (
     MiguelHiWonderFakeRos2Adapter,
     MiguelHiWonderRealProbe,
     MiguelHiWonderRos2Adapter,
+    MiguelHiWonderRos2Probe,
     MiguelRobotBus,
     MiguelRuntime,
 )
@@ -99,6 +100,11 @@ class FakeRos2Node:
         self.destroyed = True
 
 
+class FailingRos2Node(FakeRos2Node):
+    def destroy_node(self) -> None:
+        raise RuntimeError("probe destroy failed")
+
+
 def _install_fake_ros2_modules() -> tuple[dict[str, object], types.ModuleType]:
     saved = {name: sys.modules.get(name) for name in ("rclpy", "geometry_msgs", "geometry_msgs.msg")}
     rclpy = types.ModuleType("rclpy")
@@ -129,6 +135,16 @@ def _install_fake_ros2_modules() -> tuple[dict[str, object], types.ModuleType]:
     sys.modules["rclpy"] = rclpy
     sys.modules["geometry_msgs"] = geometry_msgs
     sys.modules["geometry_msgs.msg"] = geometry_msgs_msg
+    return saved, rclpy
+
+
+def _install_failing_ros2_create_node_module() -> tuple[dict[str, object], types.ModuleType]:
+    saved, rclpy = _install_fake_ros2_modules()
+
+    def create_node(name: str) -> FakeRos2Node:
+        raise RuntimeError("probe node create failed")
+
+    rclpy.create_node = create_node
     return saved, rclpy
 
 
@@ -1081,6 +1097,149 @@ def test_stage4_fake_real_ros2_close_destroys_owned_node() -> dict:
         _restore_modules(saved)
 
 
+def test_stage5_ros2_probe_module_import_does_not_import_ros_packages() -> dict:
+    sys.modules.pop("miguel_core.miguel_hiwonder_ros2_probe", None)
+    sys.modules.pop("rclpy", None)
+    sys.modules.pop("geometry_msgs", None)
+    importlib.import_module("miguel_core.miguel_hiwonder_ros2_probe")
+    assert "rclpy" not in sys.modules
+    assert "geometry_msgs" not in sys.modules
+    return {"rclpy_imported": False, "geometry_msgs_imported": False}
+
+
+def test_stage5_ros2_probe_constructor_is_inert() -> dict:
+    sys.modules.pop("rclpy", None)
+    sys.modules.pop("geometry_msgs", None)
+    probe = MiguelHiWonderRos2Probe()
+    assert probe.node is None
+    assert probe.rclpy_module is None
+    assert "rclpy" not in sys.modules
+    assert "geometry_msgs" not in sys.modules
+    return {"node": probe.node, "rclpy_module": probe.rclpy_module}
+
+
+def test_stage5_ros2_probe_check_imports_handles_missing_modules() -> dict:
+    import miguel_core.miguel_hiwonder_ros2_probe as probe_module
+
+    original_import_module = probe_module.importlib.import_module
+
+    def missing_ros_import(name: str, *args: object, **kwargs: object) -> object:
+        if name in {"rclpy", "geometry_msgs.msg"}:
+            raise ImportError(f"{name} unavailable for test")
+        return original_import_module(name, *args, **kwargs)
+
+    probe_module.importlib.import_module = missing_ros_import
+    try:
+        result = MiguelHiWonderRos2Probe().check_imports()
+    finally:
+        probe_module.importlib.import_module = original_import_module
+
+    assert result["ok"] is False
+    assert result["rclpy_available"] is False
+    assert result["geometry_msgs_available"] is False
+    assert result["reason"] == "ros2_dependency_unavailable"
+    return result
+
+
+def test_stage5_ros2_probe_check_environment_reads_expected_vars() -> dict:
+    old_values = {
+        name: os.environ.get(name)
+        for name in ("ROS_DOMAIN_ID", "ROS_LOCALHOST_ONLY", "CYCLONEDDS_URI", "RMW_IMPLEMENTATION")
+    }
+    try:
+        os.environ["ROS_DOMAIN_ID"] = "0"
+        os.environ["ROS_LOCALHOST_ONLY"] = "0"
+        os.environ["CYCLONEDDS_URI"] = "file:///etc/cyclonedds/config.xml"
+        os.environ["RMW_IMPLEMENTATION"] = "rmw_cyclonedds_cpp"
+        result = MiguelHiWonderRos2Probe().check_environment()
+    finally:
+        for name, value in old_values.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    assert result["ok"] is True
+    assert result["environment"]["ROS_DOMAIN_ID"] == "0"
+    assert result["environment"]["CYCLONEDDS_URI"] == "file:///etc/cyclonedds/config.xml"
+    return result
+
+
+def test_stage5_ros2_probe_create_node_with_fake_rclpy() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        probe = MiguelHiWonderRos2Probe()
+        result = probe.create_probe_node()
+        assert result["ok"] is True
+        assert result["node_created"] is True
+        assert len(rclpy.created_nodes) == 1
+        assert rclpy.created_nodes[0].name == "miguel_hiwonder_ros2_probe"
+        assert rclpy.created_nodes[0].publishers == []
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage5_ros2_probe_destroy_owned_fake_node() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        probe = MiguelHiWonderRos2Probe()
+        probe.create_probe_node()
+        node = rclpy.created_nodes[0]
+        result = probe.destroy_probe_node()
+        assert result["ok"] is True
+        assert result["node_destroyed"] is True
+        assert node.destroyed is True
+        assert probe.node is None
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage5_ros2_probe_readiness_never_tests_movement() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        probe = MiguelHiWonderRos2Probe()
+        result = probe.probe_readiness()
+        assert result["ok"] is True
+        assert result["ros2_available"] is True
+        assert result["node_created"] is True
+        assert result["expected_topic"] == "/controller/cmd_vel"
+        assert result["expected_msg_type"] == "geometry_msgs/msg/Twist"
+        assert result["can_publish_tested"] is False
+        assert result["movement_tested"] is False
+        assert result["hardware_verified"] is False
+        assert rclpy.created_nodes[0].publishers == []
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage5_ros2_probe_node_creation_failure_is_structured() -> dict:
+    saved, _rclpy = _install_failing_ros2_create_node_module()
+    try:
+        result = MiguelHiWonderRos2Probe().create_probe_node()
+        assert result["ok"] is False
+        assert result["node_created"] is False
+        assert result["reason"] == "ros2_probe_error"
+        assert "probe node create failed" in result["error"]
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage5_ros2_probe_destroy_failure_is_structured() -> dict:
+    probe = MiguelHiWonderRos2Probe(node=FailingRos2Node())
+    probe._owned_node = True
+    result = probe.destroy_probe_node()
+    assert result["ok"] is False
+    assert result["node_destroyed"] is False
+    assert result["reason"] == "ros2_probe_error"
+    assert "probe destroy failed" in result["error"]
+    assert probe.node is None
+    return result
+
+
 def main() -> None:
     result = test_explore_room_turn_right_allowed()
     test_unsafe_move_forward_blocked()
@@ -1158,6 +1317,15 @@ def main() -> None:
     test_stage4_fake_real_ros2_stop_publishes_zero_twist()
     test_stage4_fake_real_ros2_arm_move_forward_publishes_twist_and_stop()
     test_stage4_fake_real_ros2_close_destroys_owned_node()
+    test_stage5_ros2_probe_module_import_does_not_import_ros_packages()
+    test_stage5_ros2_probe_constructor_is_inert()
+    test_stage5_ros2_probe_check_imports_handles_missing_modules()
+    test_stage5_ros2_probe_check_environment_reads_expected_vars()
+    test_stage5_ros2_probe_create_node_with_fake_rclpy()
+    test_stage5_ros2_probe_destroy_owned_fake_node()
+    test_stage5_ros2_probe_readiness_never_tests_movement()
+    test_stage5_ros2_probe_node_creation_failure_is_structured()
+    test_stage5_ros2_probe_destroy_failure_is_structured()
 
     print("\nTelemetry:")
     pprint(result["telemetry"])
