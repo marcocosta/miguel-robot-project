@@ -1695,6 +1695,186 @@ def test_stage9_ros2_arm_refuses_unreadable_sensor() -> dict:
         _restore_modules(saved)
 
 
+def test_stage91_cmd_vel_ignores_explicit_miguel_publishers() -> dict:
+    node = FakeRos2GraphNode(
+        topics=[("/controller/cmd_vel", ["geometry_msgs/msg/Twist"])],
+        publisher_nodes_by_topic={
+            "/controller/cmd_vel": [
+                "miguel_hiwonder_ros2_adapter",
+                "miguel_hiwonder_ros2_probe",
+                "miguel_hiwonder_ros2_graph_probe",
+            ]
+        },
+        subscriber_nodes_by_topic={"/controller/cmd_vel": ["odom_publisher"]},
+    )
+    result = MiguelHiWonderRos2GraphProbe(node=node, graph_settle_sec=0.0).inspect_cmd_vel()
+    assert result["publisher_count"] == 3
+    assert result["subscription_count"] == 1
+    assert result["ignored_publishers"] == [
+        "miguel_hiwonder_ros2_adapter",
+        "miguel_hiwonder_ros2_probe",
+        "miguel_hiwonder_ros2_graph_probe",
+    ]
+    assert result["competing_publishers"] == []
+    assert result["safe_to_arm"] is True
+    return result
+
+
+def test_stage91_unknown_publisher_remains_competing() -> dict:
+    node = FakeRos2GraphNode(
+        topics=[("/controller/cmd_vel", ["geometry_msgs/msg/Twist"])],
+        subscriber_nodes_by_topic={"/controller/cmd_vel": ["odom_publisher"]},
+    )
+    node.count_publishers = lambda topic: 1
+    result = MiguelHiWonderRos2GraphProbe(node=node, graph_settle_sec=0.0).inspect_cmd_vel()
+    assert result["publisher_count"] == 1
+    assert result["competing_publishers"] == ["unknown"]
+    assert result["safe_to_arm"] is False
+    return result
+
+
+def test_stage91_odom_subscriber_endpoint_counts_as_subscription() -> dict:
+    node = FakeRos2GraphNode(
+        topics=[("/controller/cmd_vel", ["geometry_msgs/msg/Twist"])],
+        publisher_nodes_by_topic={"/controller/cmd_vel": ["miguel_hiwonder_ros2_adapter"]},
+        subscriber_nodes_by_topic={"/controller/cmd_vel": ["odom_publisher"]},
+    )
+    node.count_subscribers = lambda topic: 0
+    result = MiguelHiWonderRos2GraphProbe(node=node, graph_settle_sec=0.0).inspect_cmd_vel()
+    assert result["subscriber_nodes"] == ["odom_publisher"]
+    assert result["subscription_count"] == 1
+    assert result["safe_to_arm"] is True
+    return result
+
+
+def test_stage91_cmd_vel_no_subscribers_is_not_arm_ready() -> dict:
+    node = FakeRos2GraphNode(
+        topics=[("/controller/cmd_vel", ["geometry_msgs/msg/Twist"])],
+        publisher_nodes_by_topic={"/controller/cmd_vel": ["miguel_hiwonder_ros2_adapter"]},
+        subscriber_nodes_by_topic={"/controller/cmd_vel": []},
+    )
+    result = MiguelHiWonderRos2GraphProbe(node=node, graph_settle_sec=0.0).inspect_cmd_vel()
+    assert result["subscription_count"] == 0
+    assert result["safe_to_arm"] is True
+    adapter = MiguelHiWonderRos2Adapter(
+        publisher=FakeTwistPublisher(),
+        readiness_probe=FakeReadinessProbe(
+            clean_readiness_report(
+                graph={
+                    "cmd_vel": {
+                        "topic_exists": True,
+                        "message_type": "geometry_msgs/msg/Twist",
+                        "subscription_count": 0,
+                        "competing_publishers": [],
+                        "safe_to_arm": True,
+                    }
+                }
+            )
+        ),
+    )
+    arm = adapter.arm()
+    assert arm["ok"] is False
+    assert arm["reason"] == "cmd_vel_no_subscriber"
+    return {"inspect": result, "arm": arm}
+
+
+def test_stage91_arm_succeeds_with_only_miguel_publisher_and_odom_subscriber() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        report = clean_readiness_report(
+            graph={
+                "cmd_vel": {
+                    "topic_exists": True,
+                    "message_type": "geometry_msgs/msg/Twist",
+                    "subscription_count": 1,
+                    "publisher_nodes": ["miguel_hiwonder_ros2_adapter"],
+                    "subscriber_nodes": ["odom_publisher"],
+                    "competing_publishers": [],
+                    "ignored_publishers": ["miguel_hiwonder_ros2_adapter"],
+                    "safe_to_arm": True,
+                }
+            }
+        )
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(report),
+        )
+        readiness = adapter.check_arm_readiness()
+        result = adapter.arm()
+        assert readiness["ok"] is True
+        assert result["ok"] is True
+        assert adapter.armed is True
+        assert rclpy.created_nodes[0].publishers[0].messages == []
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage91_arm_fails_with_external_publisher_and_subscriber() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        report = clean_readiness_report(
+            cmd_vel_safe_to_arm=False,
+            competing_cmd_vel_publishers=["unknown"],
+            graph={
+                "cmd_vel": {
+                    "topic_exists": True,
+                    "message_type": "geometry_msgs/msg/Twist",
+                    "subscription_count": 1,
+                    "publisher_nodes": ["unknown"],
+                    "subscriber_nodes": ["odom_publisher"],
+                    "competing_publishers": ["unknown"],
+                    "safe_to_arm": False,
+                }
+            },
+        )
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(report),
+        )
+        result = adapter.arm()
+        assert result["ok"] is False
+        assert result["reason"] == "ros2_graph_not_safe_to_arm"
+        assert adapter.armed is False
+        assert rclpy.created_nodes[0].publishers[0].messages == []
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage91_arm_override_allows_external_publisher_with_subscriber() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        report = clean_readiness_report(
+            cmd_vel_safe_to_arm=False,
+            competing_cmd_vel_publishers=["unknown"],
+            graph={
+                "cmd_vel": {
+                    "topic_exists": True,
+                    "message_type": "geometry_msgs/msg/Twist",
+                    "subscription_count": 1,
+                    "publisher_nodes": ["unknown"],
+                    "subscriber_nodes": ["odom_publisher"],
+                    "competing_publishers": ["unknown"],
+                    "safe_to_arm": False,
+                }
+            },
+        )
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(report),
+            allow_competing_publishers_override=True,
+        )
+        result = adapter.arm()
+        assert result["ok"] is True
+        assert adapter.armed is True
+        assert result["params"]["readiness_warnings"][0]["publishers"] == ["unknown"]
+        assert rclpy.created_nodes[0].publishers[0].messages == []
+        return result
+    finally:
+        _restore_modules(saved)
+
+
 def test_stage8_graph_probe_module_import_is_inert() -> dict:
     sys.modules.pop("miguel_core.miguel_hiwonder_ros2_graph_probe", None)
     sys.modules.pop("rclpy", None)
@@ -1997,6 +2177,13 @@ def main() -> None:
     test_stage9_ros2_arm_override_allows_competing_publishers_with_warning()
     test_stage9_ros2_movement_blocked_after_failed_arm()
     test_stage9_ros2_arm_refuses_unreadable_sensor()
+    test_stage91_cmd_vel_ignores_explicit_miguel_publishers()
+    test_stage91_unknown_publisher_remains_competing()
+    test_stage91_odom_subscriber_endpoint_counts_as_subscription()
+    test_stage91_cmd_vel_no_subscribers_is_not_arm_ready()
+    test_stage91_arm_succeeds_with_only_miguel_publisher_and_odom_subscriber()
+    test_stage91_arm_fails_with_external_publisher_and_subscriber()
+    test_stage91_arm_override_allows_external_publisher_with_subscriber()
     test_stage8_graph_probe_module_import_is_inert()
     test_stage8_graph_probe_constructor_is_inert()
     test_stage8_fake_node_list_and_topics_work()

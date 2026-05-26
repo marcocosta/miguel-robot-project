@@ -86,7 +86,7 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
     def arm(self) -> dict:
         if not self.available:
             return self._unavailable("arm")
-        gate_result = self._validate_arm_readiness()
+        gate_result = self.check_arm_readiness()
         if not gate_result["ok"]:
             return self._record(
                 "arm",
@@ -105,6 +105,9 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
             params={"readiness_warnings": gate_result.get("warnings", [])},
             payload=gate_result.get("readiness_report"),
         )
+
+    def check_arm_readiness(self) -> dict:
+        return self._validate_arm_readiness()
 
     def disarm(self) -> dict:
         stop_result = self.stop("adapter disarm")

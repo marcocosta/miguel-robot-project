@@ -21,6 +21,11 @@ class MiguelHiWonderRos2GraphProbe:
     LIDAR_TOPIC = "/scan_raw"
     ODOM_TOPIC = "/odom"
     EXPECTED_CMD_VEL_TYPE = "geometry_msgs/msg/Twist"
+    MIGUEL_NODE_NAMES = {
+        "miguel_hiwonder_ros2_adapter",
+        "miguel_hiwonder_ros2_probe",
+        "miguel_hiwonder_ros2_graph_probe",
+    }
     MIGUEL_NODE_HINTS = ("miguel",)
 
     def __init__(
@@ -28,10 +33,17 @@ class MiguelHiWonderRos2GraphProbe:
         rclpy_module: object | None = None,
         node: object | None = None,
         expected_cmd_vel_topic: str = "/controller/cmd_vel",
+        ignored_publisher_node_names: list[str] | tuple[str, ...] | None = None,
+        graph_settle_sec: float = 0.2,
     ) -> None:
         self.rclpy_module = rclpy_module
         self.node = node
         self.expected_cmd_vel_topic = expected_cmd_vel_topic
+        self.ignored_publisher_node_names = {
+            self._normalize_node_name(name)
+            for name in (ignored_publisher_node_names or [])
+        }
+        self.graph_settle_sec = graph_settle_sec
         self._owned_node = False
 
     def create_node(self) -> dict:
@@ -43,6 +55,7 @@ class MiguelHiWonderRos2GraphProbe:
                 rclpy.init(args=None)
             self.node = rclpy.create_node(self.NODE_NAME)
             self._owned_node = True
+            self._settle_graph()
             return self._result(ok=True, node_created=True, node_name=self.NODE_NAME, reason="ok")
         except Exception as exc:
             return self._result(
@@ -108,27 +121,44 @@ class MiguelHiWonderRos2GraphProbe:
         except Exception as exc:
             return self._result(ok=False, topics={}, count=0, reason="ros2_probe_error", error=str(exc))
 
-    def inspect_cmd_vel(self) -> dict:
+    def inspect_cmd_vel(
+        self,
+        ignored_publisher_node_names: list[str] | tuple[str, ...] | None = None,
+        graph_settle_sec: float | None = None,
+    ) -> dict:
         node_result = self._ensure_node()
         if not node_result["ok"]:
             result = self._cmd_vel_base()
             result.update(node_result)
             return result
         try:
+            self._settle_graph(graph_settle_sec)
             topics_result = self.list_topics()
             topics = topics_result.get("topics", {}) if topics_result.get("ok") else {}
             topic_types = topics.get(self.expected_cmd_vel_topic, [])
             message_type = topic_types[0] if topic_types else None
             topic_exists = self.expected_cmd_vel_topic in topics
-            publisher_count = self._count_publishers(self.expected_cmd_vel_topic)
-            subscription_count = self._count_subscribers(self.expected_cmd_vel_topic)
             publisher_nodes = self._topic_endpoint_nodes(self.expected_cmd_vel_topic, "publishers")
             subscriber_nodes = self._topic_endpoint_nodes(self.expected_cmd_vel_topic, "subscribers")
-            competing_publishers = [
-                name for name in publisher_nodes if not self._is_miguel_node(name)
-            ]
-            if not publisher_nodes and publisher_count > 0:
-                competing_publishers = ["unknown"] * publisher_count
+            raw_publisher_count = self._count_publishers(self.expected_cmd_vel_topic)
+            raw_subscription_count = self._count_subscribers(self.expected_cmd_vel_topic)
+            publisher_count = max(raw_publisher_count, len(publisher_nodes))
+            subscription_count = max(raw_subscription_count, len(subscriber_nodes))
+            ignored_names = set(self.ignored_publisher_node_names)
+            ignored_names.update(
+                self._normalize_node_name(name)
+                for name in (ignored_publisher_node_names or [])
+            )
+            competing_publishers = []
+            ignored_publishers = []
+            for name in publisher_nodes:
+                if self._is_ignored_publisher(name, ignored_names):
+                    ignored_publishers.append(name)
+                else:
+                    competing_publishers.append(name)
+            unknown_count = max(0, publisher_count - len(publisher_nodes))
+            if unknown_count:
+                competing_publishers.extend(["unknown"] * unknown_count)
             safe_to_arm = len(competing_publishers) == 0
             return self._result(
                 ok=True,
@@ -139,6 +169,7 @@ class MiguelHiWonderRos2GraphProbe:
                 subscription_count=subscription_count,
                 publisher_nodes=publisher_nodes,
                 subscriber_nodes=subscriber_nodes,
+                ignored_publishers=ignored_publishers,
                 competing_publishers=competing_publishers,
                 safe_to_arm=safe_to_arm,
                 movement_tested=False,
@@ -322,7 +353,11 @@ class MiguelHiWonderRos2GraphProbe:
         )
         try:
             if hasattr(self.node, method_name):
-                return [self._endpoint_node_name(info) for info in getattr(self.node, method_name)(topic)]
+                endpoint_names = [
+                    self._endpoint_node_name(info)
+                    for info in getattr(self.node, method_name)(topic)
+                ]
+                return [name for name in endpoint_names if name]
         except Exception:
             return []
         attr_name = "publisher_nodes_by_topic" if endpoint_kind == "publishers" else "subscriber_nodes_by_topic"
@@ -340,6 +375,28 @@ class MiguelHiWonderRos2GraphProbe:
         if node_namespace and str(node_namespace) not in {"/", ""}:
             return f"{node_namespace}/{node_name}".replace("//", "/")
         return str(node_name)
+
+    def _settle_graph(self, graph_settle_sec: float | None = None) -> None:
+        settle_sec = self.graph_settle_sec if graph_settle_sec is None else graph_settle_sec
+        try:
+            settle = max(0.0, float(settle_sec or 0.0))
+        except (TypeError, ValueError):
+            settle = 0.0
+        if settle <= 0.0 or self.node is None:
+            return
+        try:
+            rclpy = self._get_rclpy()
+        except Exception:
+            return
+        deadline = time.monotonic() + settle
+        while time.monotonic() <= deadline:
+            if hasattr(rclpy, "spin_once"):
+                try:
+                    rclpy.spin_once(self.node, timeout_sec=min(0.05, settle))
+                except Exception:
+                    return
+            else:
+                time.sleep(min(0.05, settle))
 
     def _summarize_lidar(self, scan: object) -> dict:
         ranges = list(getattr(scan, "ranges", []) or [])
@@ -445,6 +502,7 @@ class MiguelHiWonderRos2GraphProbe:
             "subscription_count": 0,
             "publisher_nodes": [],
             "subscriber_nodes": [],
+            "ignored_publishers": [],
             "competing_publishers": [],
             "safe_to_arm": False,
             "movement_tested": False,
@@ -462,8 +520,21 @@ class MiguelHiWonderRos2GraphProbe:
         )
 
     def _is_miguel_node(self, name: str) -> bool:
-        lower = str(name or "").lower()
-        return any(hint in lower for hint in self.MIGUEL_NODE_HINTS)
+        normalized = self._normalize_node_name(name)
+        return normalized in self.MIGUEL_NODE_NAMES or any(
+            hint in normalized for hint in self.MIGUEL_NODE_HINTS
+        )
+
+    def _is_ignored_publisher(self, name: str, ignored_names: set[str]) -> bool:
+        normalized = self._normalize_node_name(name)
+        return normalized in ignored_names or self._is_miguel_node(name)
+
+    @staticmethod
+    def _normalize_node_name(name: object) -> str:
+        text = str(name or "").strip().lower()
+        if "/" in text:
+            text = text.rstrip("/").split("/")[-1]
+        return text
 
     def _result(self, **fields: object) -> dict:
         fields.setdefault("timestamp", self._utc_now())
