@@ -32,6 +32,14 @@ class MiguelHiWonderBridge:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.telemetry_path = self.data_dir / "miguel_hiwonder_telemetry.json"
 
+    def arm(self) -> dict:
+        print("[MIGUEL_HIWONDER] arm")
+        return self.adapter.arm()
+
+    def disarm(self) -> dict:
+        print("[MIGUEL_HIWONDER] disarm")
+        return self.adapter.disarm()
+
     def stop(self, reason: str | None = None) -> dict:
         print(f"[MIGUEL_HIWONDER] stop reason={reason or 'none'}")
         validation = self.safety.validate_command(
@@ -48,7 +56,7 @@ class MiguelHiWonderBridge:
             safety_payload,
         )
         result["safety_validation"] = validation
-        result["adapter_result"] = self.adapter.send_command("stop", params, safety_payload)
+        result["adapter_result"] = self.adapter.stop(params["reason"])
         return result
 
     def move_forward(self, speed: str = "slow", duration_sec: float = 1.0) -> dict:
@@ -118,7 +126,7 @@ class MiguelHiWonderBridge:
                 safety_payload,
             )
             result["safety_validation"] = validation
-            result["adapter_result"] = self.adapter.send_command("stop", stop_params, safety_payload)
+            result["adapter_result"] = self.adapter.stop(stop_params["reason"])
             return result
 
         params = validation["adjusted_params"]
@@ -131,7 +139,7 @@ class MiguelHiWonderBridge:
             safety_payload,
         )
         result["safety_validation"] = validation
-        result["adapter_result"] = self.adapter.send_command(command, params, safety_payload)
+        result["adapter_result"] = self.adapter.set_velocity(command, params["speed"], params["duration_sec"])
         return result
 
     def _safety_payload(self, validation: dict) -> dict:

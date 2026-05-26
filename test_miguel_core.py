@@ -125,6 +125,87 @@ def test_probe_runs_without_crashing() -> dict:
     return result
 
 
+def test_stage1_adapter_initializes_disarmed_without_commands() -> dict:
+    adapter = MiguelHiWonderDryRunAdapter()
+    assert adapter.get_name() == "dry_run"
+    assert adapter.armed is False
+    assert adapter.command_log == []
+    return {"armed": adapter.armed, "commands": len(adapter.command_log)}
+
+
+def test_stage1_runtime_start_emits_no_hardware_commands() -> dict:
+    runtime = _runtime()
+    adapter = runtime.hiwonder.adapter
+    assert isinstance(adapter, MiguelHiWonderDryRunAdapter)
+    assert adapter.command_log == []
+    runtime.shutdown()
+    return {"commands_before_shutdown": 0}
+
+
+def test_stage1_movement_while_disarmed_blocked() -> dict:
+    adapter = MiguelHiWonderDryRunAdapter()
+    result = adapter.set_velocity("move_forward", "slow", 1.0)
+    assert result["blocked"] is True
+    assert result["reason"] == "adapter_disarmed"
+    assert len(adapter.command_log) == 1
+    return result
+
+
+def test_stage1_arm_then_move_forward_records_twist_and_stop() -> dict:
+    adapter = MiguelHiWonderDryRunAdapter()
+    adapter.arm()
+    result = adapter.set_velocity("move_forward", "slow", 1.0)
+    assert result["ok"] is True
+    assert result["blocked"] is False
+    assert result["twist"]["linear_x"] > 0
+    assert abs(result["twist"]["linear_x"]) <= adapter.MAX_LINEAR_X
+    assert result["followup_stop"]["command"] == "stop"
+    assert adapter.command_log[-2]["command"] == "move_forward"
+    assert adapter.command_log[-1]["command"] == "stop"
+    return result
+
+
+def test_stage1_stale_telemetry_blocks_movement() -> dict:
+    runtime = _runtime()
+    runtime.hiwonder.arm()
+    result = runtime.hiwonder.move_forward()
+    assert result["payload"]["command"] == "stop"
+    assert result["safety_validation"]["blocked"] is True
+    assert result["safety_validation"]["reason"] == "telemetry_missing_or_stale"
+    assert result["adapter_result"]["command"] == "stop"
+    runtime.shutdown()
+    return result
+
+
+def test_stage1_emergency_stop_records_stop() -> dict:
+    runtime = _runtime()
+    runtime.hiwonder.arm()
+    _set_telemetry(runtime, emergency_stop=True)
+    result = runtime.hiwonder.move_forward()
+    assert result["payload"]["command"] == "stop"
+    assert result["safety_validation"]["reason"] == "emergency_stop"
+    assert runtime.hiwonder.adapter.command_log[-1]["command"] == "stop"
+    runtime.shutdown()
+    return result
+
+
+def test_stage1_adapter_duration_cap() -> dict:
+    adapter = MiguelHiWonderDryRunAdapter()
+    adapter.arm()
+    result = adapter.set_velocity("move_forward", "slow", 99.0)
+    assert result["params"]["duration_sec"] == adapter.MAX_DURATION_SEC
+    return result
+
+
+def test_stage1_adapter_speed_cap() -> dict:
+    adapter = MiguelHiWonderDryRunAdapter()
+    adapter.arm()
+    result = adapter.set_velocity("move_forward", "fast", 1.0)
+    assert result["params"]["speed"] == "slow"
+    assert abs(result["twist"]["linear_x"]) <= adapter.MAX_LINEAR_X
+    return result
+
+
 def main() -> None:
     result = test_explore_room_turn_right_allowed()
     test_unsafe_move_forward_blocked()
@@ -134,6 +215,14 @@ def main() -> None:
     test_mission_controller_records_steps()
     test_default_bridge_uses_dry_run_adapter()
     test_probe_runs_without_crashing()
+    test_stage1_adapter_initializes_disarmed_without_commands()
+    test_stage1_runtime_start_emits_no_hardware_commands()
+    test_stage1_movement_while_disarmed_blocked()
+    test_stage1_arm_then_move_forward_records_twist_and_stop()
+    test_stage1_stale_telemetry_blocks_movement()
+    test_stage1_emergency_stop_records_stop()
+    test_stage1_adapter_duration_cap()
+    test_stage1_adapter_speed_cap()
 
     print("\nTelemetry:")
     pprint(result["telemetry"])
