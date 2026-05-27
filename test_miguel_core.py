@@ -22,6 +22,36 @@ from miguel_core import (
     MiguelRuntime,
 )
 
+ROS_TEST_MODULE_ROOTS = {
+    "rclpy",
+    "geometry_msgs",
+    "nav_msgs",
+    "sensor_msgs",
+    "std_msgs",
+    "ros_robot_controller_msgs",
+}
+_MISSING_MODULE = object()
+
+
+def _is_ros_test_module(name: str) -> bool:
+    root = name.split(".", 1)[0]
+    return root in ROS_TEST_MODULE_ROOTS
+
+
+def _snapshot_ros_modules() -> dict[str, object]:
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if _is_ros_test_module(name)
+    }
+
+
+_INITIAL_REAL_ROS_MODULES = {
+    name
+    for name, module in _snapshot_ros_modules().items()
+    if module is not None and not getattr(module, "_miguel_fake_ros2_module", False)
+}
+
 
 class FakeTwistPublisher:
     def __init__(self) -> None:
@@ -69,12 +99,16 @@ def clean_readiness_report(**overrides: object) -> dict:
         "ok": True,
         "cmd_vel_safe_to_arm": True,
         "competing_cmd_vel_publishers": [],
+        "low_level_motor_chain_ok": True,
+        "direct_motor_safe_to_arm": True,
+        "external_direct_motor_publishers": [],
         "battery_ok": True,
         "battery_readable": True,
         "lidar_ok": True,
         "lidar_readable": True,
         "odom_ok": True,
         "odom_readable": True,
+        "selected_odom_topic": "/odom",
         "movement_tested": False,
         "hardware_verified": False,
         "graph": {
@@ -88,7 +122,25 @@ def clean_readiness_report(**overrides: object) -> dict:
                 "subscriber_nodes": ["odom_publisher"],
                 "competing_publishers": [],
                 "safe_to_arm": True,
-            }
+            },
+            "direct_motor": {
+                "topic": "/ros_robot_controller/set_motor",
+                "topic_exists": True,
+                "message_type": "ros_robot_controller_msgs/msg/MotorsState",
+                "publisher_count": 1,
+                "subscription_count": 1,
+                "publisher_nodes": ["odom_publisher"],
+                "subscriber_nodes": ["ros_robot_controller"],
+                "required_subscriber_present": True,
+                "external_direct_motor_publishers": [],
+                "safe_direct_motor_control": True,
+            },
+            "motor_chain": {
+                "cmd_vel_receiver_ok": True,
+                "motor_receiver_ok": True,
+                "odom_publisher_to_motor_ok": True,
+                "low_level_motor_chain_ok": True,
+            },
         },
     }
     report.update(overrides)
@@ -280,36 +332,117 @@ class FakeOdometry:
         )
 
 
-def _install_fake_ros2_modules() -> tuple[dict[str, object], types.ModuleType]:
-    saved = {name: sys.modules.get(name) for name in ("rclpy", "geometry_msgs", "geometry_msgs.msg")}
+class FakeMotorsState:
+    pass
+
+
+def _make_ros_module(name: str) -> types.ModuleType:
+    module = types.ModuleType(name)
+    module._miguel_fake_ros2_module = True
+    if "." not in name:
+        module.__path__ = []
+    return module
+
+
+def _make_fake_ros2_modules(node: FakeRos2GraphNode | None = None) -> dict[str, types.ModuleType]:
     rclpy = types.ModuleType("rclpy")
+    rclpy._miguel_fake_ros2_module = True
+    rclpy.__path__ = []
     rclpy.init_calls = 0
     rclpy.created_nodes = []
 
     def ok() -> bool:
-        return False
+        return node is not None
 
     def init(args: object = None) -> None:
         rclpy.init_calls += 1
 
-    def create_node(name: str) -> FakeRos2Node:
-        node = FakeRos2Node()
-        node.name = name
-        rclpy.created_nodes.append(node)
-        return node
+    def create_node(name: str) -> FakeRos2Node | FakeRos2GraphNode:
+        if node is not None:
+            node.name = name
+            rclpy.created_nodes.append(node)
+            return node
+        created = FakeRos2Node()
+        created.name = name
+        rclpy.created_nodes.append(created)
+        return created
+
+    def spin_once(spin_node: FakeRos2GraphNode, timeout_sec: float = 0.0) -> None:
+        spin_node.spin_once()
 
     rclpy.ok = ok
     rclpy.init = init
     rclpy.create_node = create_node
+    rclpy.spin_once = spin_once
 
-    geometry_msgs = types.ModuleType("geometry_msgs")
-    geometry_msgs_msg = types.ModuleType("geometry_msgs.msg")
+    geometry_msgs = _make_ros_module("geometry_msgs")
+    geometry_msgs_msg = _make_ros_module("geometry_msgs.msg")
     geometry_msgs_msg.Twist = FakeRos2Twist
     geometry_msgs.msg = geometry_msgs_msg
 
+    std_msgs = _make_ros_module("std_msgs")
+    std_msgs_msg = _make_ros_module("std_msgs.msg")
+    std_msgs_msg.UInt16 = FakeUInt16
+    std_msgs.msg = std_msgs_msg
+
+    sensor_msgs = _make_ros_module("sensor_msgs")
+    sensor_msgs_msg = _make_ros_module("sensor_msgs.msg")
+    sensor_msgs_msg.LaserScan = FakeLaserScan
+    sensor_msgs.msg = sensor_msgs_msg
+
+    nav_msgs = _make_ros_module("nav_msgs")
+    nav_msgs_msg = _make_ros_module("nav_msgs.msg")
+    nav_msgs_msg.Odometry = FakeOdometry
+    nav_msgs.msg = nav_msgs_msg
+
+    controller_msgs = _make_ros_module("ros_robot_controller_msgs")
+    controller_msgs_msg = _make_ros_module("ros_robot_controller_msgs.msg")
+    controller_msgs_msg.MotorsState = FakeMotorsState
+    controller_msgs.msg = controller_msgs_msg
+
+    return {
+        "rclpy": rclpy,
+        "geometry_msgs": geometry_msgs,
+        "geometry_msgs.msg": geometry_msgs_msg,
+        "std_msgs": std_msgs,
+        "std_msgs.msg": std_msgs_msg,
+        "sensor_msgs": sensor_msgs,
+        "sensor_msgs.msg": sensor_msgs_msg,
+        "nav_msgs": nav_msgs,
+        "nav_msgs.msg": nav_msgs_msg,
+        "ros_robot_controller_msgs": controller_msgs,
+        "ros_robot_controller_msgs.msg": controller_msgs_msg,
+    }
+
+
+def _install_ros2_import_loader(fake_modules: dict[str, types.ModuleType] | None = None) -> dict[str, object]:
+    saved = {
+        "__import_module__": importlib.import_module,
+        "__ros_modules__": _snapshot_ros_modules(),
+    }
+    fake_modules = fake_modules or {}
+    for name in list(sys.modules):
+        if _is_ros_test_module(name):
+            sys.modules.pop(name, None)
+    for name, module in fake_modules.items():
+        sys.modules[name] = module
+
+    def test_ros_import(name: str, *args: object, **kwargs: object) -> object:
+        if _is_ros_test_module(name):
+            if name in fake_modules:
+                return fake_modules[name]
+            raise ImportError(f"{name} unavailable for test")
+        return saved["__import_module__"](name, *args, **kwargs)
+
+    importlib.import_module = test_ros_import
+    return saved
+
+
+def _install_fake_ros2_modules() -> tuple[dict[str, object], types.ModuleType]:
+    fake_modules = _make_fake_ros2_modules()
+    saved = _install_ros2_import_loader(fake_modules)
+    rclpy = fake_modules["rclpy"]
     sys.modules["rclpy"] = rclpy
-    sys.modules["geometry_msgs"] = geometry_msgs
-    sys.modules["geometry_msgs.msg"] = geometry_msgs_msg
     return saved, rclpy
 
 
@@ -324,72 +457,53 @@ def _install_failing_ros2_create_node_module() -> tuple[dict[str, object], types
 
 
 def _install_fake_graph_ros2_modules(node: FakeRos2GraphNode) -> tuple[dict[str, object], types.ModuleType]:
-    saved = {
-        name: sys.modules.get(name)
-        for name in (
-            "rclpy",
-            "std_msgs",
-            "std_msgs.msg",
-            "sensor_msgs",
-            "sensor_msgs.msg",
-            "nav_msgs",
-            "nav_msgs.msg",
-        )
-    }
-    rclpy = types.ModuleType("rclpy")
-    rclpy.init_calls = 0
-    rclpy.created_nodes = []
-
-    def ok() -> bool:
-        return True
-
-    def init(args: object = None) -> None:
-        rclpy.init_calls += 1
-
-    def create_node(name: str) -> FakeRos2GraphNode:
-        node.name = name
-        rclpy.created_nodes.append(node)
-        return node
-
-    def spin_once(spin_node: FakeRos2GraphNode, timeout_sec: float = 0.0) -> None:
-        spin_node.spin_once()
-
-    rclpy.ok = ok
-    rclpy.init = init
-    rclpy.create_node = create_node
-    rclpy.spin_once = spin_once
-
-    std_msgs = types.ModuleType("std_msgs")
-    std_msgs_msg = types.ModuleType("std_msgs.msg")
-    std_msgs_msg.UInt16 = FakeUInt16
-    std_msgs.msg = std_msgs_msg
-
-    sensor_msgs = types.ModuleType("sensor_msgs")
-    sensor_msgs_msg = types.ModuleType("sensor_msgs.msg")
-    sensor_msgs_msg.LaserScan = FakeLaserScan
-    sensor_msgs.msg = sensor_msgs_msg
-
-    nav_msgs = types.ModuleType("nav_msgs")
-    nav_msgs_msg = types.ModuleType("nav_msgs.msg")
-    nav_msgs_msg.Odometry = FakeOdometry
-    nav_msgs.msg = nav_msgs_msg
-
-    sys.modules["rclpy"] = rclpy
-    sys.modules["std_msgs"] = std_msgs
-    sys.modules["std_msgs.msg"] = std_msgs_msg
-    sys.modules["sensor_msgs"] = sensor_msgs
-    sys.modules["sensor_msgs.msg"] = sensor_msgs_msg
-    sys.modules["nav_msgs"] = nav_msgs
-    sys.modules["nav_msgs.msg"] = nav_msgs_msg
+    fake_modules = _make_fake_ros2_modules(node)
+    saved = _install_ros2_import_loader(fake_modules)
+    rclpy = fake_modules["rclpy"]
     return saved, rclpy
 
 
 def _restore_modules(saved: dict[str, object]) -> None:
+    original_import_module = saved.get("__import_module__")
+    if original_import_module is not None:
+        importlib.import_module = original_import_module
+
+    ros_modules = saved.get("__ros_modules__")
+    if isinstance(ros_modules, dict):
+        for name in list(sys.modules):
+            if _is_ros_test_module(name) and name not in ros_modules:
+                sys.modules.pop(name, None)
+        for name, module in ros_modules.items():
+            sys.modules[name] = module
+
     for name, module in saved.items():
-        if module is None:
+        if name.startswith("__") or _is_ros_test_module(name):
+            continue
+        if module is _MISSING_MODULE:
             sys.modules.pop(name, None)
         else:
             sys.modules[name] = module
+
+
+def _save_and_remove_modules(*names: str) -> dict[str, object]:
+    saved = {name: sys.modules.get(name, _MISSING_MODULE) for name in names}
+    if any(_is_ros_test_module(name) for name in names):
+        saved["__ros_modules__"] = _snapshot_ros_modules()
+        for name in list(sys.modules):
+            if _is_ros_test_module(name):
+                sys.modules.pop(name, None)
+    for name in names:
+        sys.modules.pop(name, None)
+    return saved
+
+
+def _assert_no_real_ros_modules_loaded() -> None:
+    offenders = []
+    for name, module in sys.modules.items():
+        if _is_ros_test_module(name) and name not in _INITIAL_REAL_ROS_MODULES and module is not None:
+            if not getattr(module, "_miguel_fake_ros2_module", False):
+                offenders.append(name)
+    assert offenders == [], f"unit tests imported host ROS modules: {offenders[:8]}"
 
 
 def _runtime() -> MiguelRuntime:
@@ -915,13 +1029,19 @@ def test_stage3_bridge_still_defaults_to_dry_run() -> dict:
 
 
 def test_stage3_ros2_module_import_does_not_import_ros_packages() -> dict:
-    sys.modules.pop("miguel_core.miguel_hiwonder_ros2_adapter", None)
-    sys.modules.pop("rclpy", None)
-    sys.modules.pop("geometry_msgs", None)
-    importlib.import_module("miguel_core.miguel_hiwonder_ros2_adapter")
-    assert "rclpy" not in sys.modules
-    assert "geometry_msgs" not in sys.modules
-    return {"rclpy_imported": False, "geometry_msgs_imported": False}
+    saved = _save_and_remove_modules(
+        "miguel_core.miguel_hiwonder_ros2_adapter",
+        "rclpy",
+        "geometry_msgs",
+        "geometry_msgs.msg",
+    )
+    try:
+        importlib.import_module("miguel_core.miguel_hiwonder_ros2_adapter")
+        assert "rclpy" not in sys.modules
+        assert "geometry_msgs" not in sys.modules
+        return {"rclpy_imported": False, "geometry_msgs_imported": False}
+    finally:
+        _restore_modules(saved)
 
 
 def test_stage3_ros2_without_publisher_is_unavailable() -> dict:
@@ -1108,17 +1228,41 @@ def test_stage31_ros2_injected_publisher_is_not_real_hardware() -> dict:
     return status
 
 
-def test_stage31_ros2_allow_real_without_publisher_is_not_implemented() -> dict:
-    adapter = MiguelHiWonderRos2Adapter(allow_real_ros2=True)
-    status = adapter.backend_status()
-    result = adapter.set_velocity("move_forward", "slow", 1.0)
-    assert status["available"] is False
-    assert status["real_ros2_enabled"] is False
-    assert status["hardware_verified"] is False
+def test_stage31_ros2_real_backend_requires_explicit_opt_in() -> dict:
+    import_calls: list[str] = []
+    saved = _install_ros2_import_loader()
+    blocked_import_module = importlib.import_module
+
+    def missing_ros_import(name: str, *args: object, **kwargs: object) -> object:
+        import_calls.append(name)
+        return blocked_import_module(name, *args, **kwargs)
+
+    importlib.import_module = missing_ros_import
+    try:
+        default_adapter = MiguelHiWonderRos2Adapter()
+        default_status = default_adapter.backend_status()
+        assert default_status["available"] is False
+        assert default_status["backend"] == "unavailable"
+        assert default_status["real_ros2_enabled"] is False
+        assert default_status["reason"] == "adapter_unavailable"
+        assert import_calls == []
+
+        real_adapter = MiguelHiWonderRos2Adapter(allow_real_ros2=True)
+        real_status = real_adapter.backend_status()
+        result = real_adapter.set_velocity("move_forward", "slow", 1.0)
+    finally:
+        _restore_modules(saved)
+
+    assert "rclpy" in import_calls
+    assert real_status["available"] is False
+    assert real_status["backend"] == "unavailable"
+    assert real_status["real_ros2_enabled"] is False
+    assert real_status["hardware_verified"] is False
+    assert real_status["reason"] == "ros2_dependency_unavailable"
     assert result["ok"] is False
     assert result["blocked"] is True
-    assert result["reason"] in {"ros2_dependency_unavailable", "ros2_init_error"}
-    return result
+    assert result["reason"] == "ros2_dependency_unavailable"
+    return {"default": default_status, "real": real_status, "result": result}
 
 
 def test_stage31_ros2_twist_factory_failure_on_movement_is_structured() -> dict:
@@ -1236,23 +1380,14 @@ def test_stage31_ros2_no_publisher_close_is_unavailable() -> dict:
 
 
 def test_stage4_allow_real_ros2_missing_dependencies_is_structured() -> dict:
-    import miguel_core.miguel_hiwonder_ros2_adapter as ros2_module
-
-    original_import_module = ros2_module.importlib.import_module
-
-    def missing_ros_import(name: str, *args: object, **kwargs: object) -> object:
-        if name in {"rclpy", "geometry_msgs.msg"}:
-            raise ImportError(f"{name} unavailable for test")
-        return original_import_module(name, *args, **kwargs)
-
-    ros2_module.importlib.import_module = missing_ros_import
+    saved = _install_ros2_import_loader()
     try:
         adapter = MiguelHiWonderRos2Adapter(
             allow_real_ros2=True,
             require_safe_graph_to_arm=False,
         )
     finally:
-        ros2_module.importlib.import_module = original_import_module
+        _restore_modules(saved)
 
     status = adapter.backend_status()
     assert status["available"] is False
@@ -1346,41 +1481,40 @@ def test_stage4_fake_real_ros2_close_destroys_owned_node() -> dict:
 
 
 def test_stage5_ros2_probe_module_import_does_not_import_ros_packages() -> dict:
-    sys.modules.pop("miguel_core.miguel_hiwonder_ros2_probe", None)
-    sys.modules.pop("rclpy", None)
-    sys.modules.pop("geometry_msgs", None)
-    importlib.import_module("miguel_core.miguel_hiwonder_ros2_probe")
-    assert "rclpy" not in sys.modules
-    assert "geometry_msgs" not in sys.modules
-    return {"rclpy_imported": False, "geometry_msgs_imported": False}
+    saved = _save_and_remove_modules(
+        "miguel_core.miguel_hiwonder_ros2_probe",
+        "rclpy",
+        "geometry_msgs",
+        "geometry_msgs.msg",
+    )
+    try:
+        importlib.import_module("miguel_core.miguel_hiwonder_ros2_probe")
+        assert "rclpy" not in sys.modules
+        assert "geometry_msgs" not in sys.modules
+        return {"rclpy_imported": False, "geometry_msgs_imported": False}
+    finally:
+        _restore_modules(saved)
 
 
 def test_stage5_ros2_probe_constructor_is_inert() -> dict:
-    sys.modules.pop("rclpy", None)
-    sys.modules.pop("geometry_msgs", None)
-    probe = MiguelHiWonderRos2Probe()
-    assert probe.node is None
-    assert probe.rclpy_module is None
-    assert "rclpy" not in sys.modules
-    assert "geometry_msgs" not in sys.modules
-    return {"node": probe.node, "rclpy_module": probe.rclpy_module}
+    saved = _save_and_remove_modules("rclpy", "geometry_msgs", "geometry_msgs.msg")
+    try:
+        probe = MiguelHiWonderRos2Probe()
+        assert probe.node is None
+        assert probe.rclpy_module is None
+        assert "rclpy" not in sys.modules
+        assert "geometry_msgs" not in sys.modules
+        return {"node": probe.node, "rclpy_module": probe.rclpy_module}
+    finally:
+        _restore_modules(saved)
 
 
 def test_stage5_ros2_probe_check_imports_handles_missing_modules() -> dict:
-    import miguel_core.miguel_hiwonder_ros2_probe as probe_module
-
-    original_import_module = probe_module.importlib.import_module
-
-    def missing_ros_import(name: str, *args: object, **kwargs: object) -> object:
-        if name in {"rclpy", "geometry_msgs.msg"}:
-            raise ImportError(f"{name} unavailable for test")
-        return original_import_module(name, *args, **kwargs)
-
-    probe_module.importlib.import_module = missing_ros_import
+    saved = _install_ros2_import_loader()
     try:
         result = MiguelHiWonderRos2Probe().check_imports()
     finally:
-        probe_module.importlib.import_module = original_import_module
+        _restore_modules(saved)
 
     assert result["ok"] is False
     assert result["rclpy_available"] is False
@@ -1415,8 +1549,8 @@ def test_stage5_ros2_probe_check_environment_reads_expected_vars() -> dict:
 
 def test_stage5_ros2_probe_create_node_with_fake_rclpy() -> dict:
     saved, rclpy = _install_fake_ros2_modules()
+    probe = MiguelHiWonderRos2Probe()
     try:
-        probe = MiguelHiWonderRos2Probe()
         result = probe.create_probe_node()
         assert result["ok"] is True
         assert result["node_created"] is True
@@ -1425,13 +1559,14 @@ def test_stage5_ros2_probe_create_node_with_fake_rclpy() -> dict:
         assert rclpy.created_nodes[0].publishers == []
         return result
     finally:
+        probe.destroy_probe_node()
         _restore_modules(saved)
 
 
 def test_stage5_ros2_probe_destroy_owned_fake_node() -> dict:
     saved, rclpy = _install_fake_ros2_modules()
+    probe = MiguelHiWonderRos2Probe()
     try:
-        probe = MiguelHiWonderRos2Probe()
         probe.create_probe_node()
         node = rclpy.created_nodes[0]
         result = probe.destroy_probe_node()
@@ -1446,8 +1581,8 @@ def test_stage5_ros2_probe_destroy_owned_fake_node() -> dict:
 
 def test_stage5_ros2_probe_readiness_never_tests_movement() -> dict:
     saved, rclpy = _install_fake_ros2_modules()
+    probe = MiguelHiWonderRos2Probe()
     try:
-        probe = MiguelHiWonderRos2Probe()
         result = probe.probe_readiness()
         assert result["ok"] is True
         assert result["ros2_available"] is True
@@ -1460,6 +1595,7 @@ def test_stage5_ros2_probe_readiness_never_tests_movement() -> dict:
         assert rclpy.created_nodes[0].publishers == []
         return result
     finally:
+        probe.destroy_probe_node()
         _restore_modules(saved)
 
 
@@ -1875,33 +2011,236 @@ def test_stage91_arm_override_allows_external_publisher_with_subscriber() -> dic
         _restore_modules(saved)
 
 
+def test_stage10_odom_fallback_uses_odom_raw() -> dict:
+    node = FakeRos2GraphNode(messages_by_topic={"/odom_raw": [FakeOdometry()]})
+    saved, _rclpy = _install_fake_graph_ros2_modules(node)
+    try:
+        result = MiguelHiWonderRos2GraphProbe().read_odom_once(timeout_sec=0.01)
+    finally:
+        _restore_modules(saved)
+    assert result["ok"] is True
+    assert result["topic"] == "/odom_raw"
+    assert result["selected_topic"] == "/odom_raw"
+    assert result["x"] == 1.25
+    return result
+
+
+def test_stage10_set_motor_inspection_detects_required_subscriber() -> dict:
+    node = FakeRos2GraphNode(
+        topics=[
+            (
+                "/ros_robot_controller/set_motor",
+                ["ros_robot_controller_msgs/msg/MotorsState"],
+            )
+        ],
+        publisher_nodes_by_topic={"/ros_robot_controller/set_motor": ["odom_publisher"]},
+        subscriber_nodes_by_topic={"/ros_robot_controller/set_motor": ["ros_robot_controller"]},
+    )
+    result = MiguelHiWonderRos2GraphProbe(node=node, graph_settle_sec=0.0).inspect_direct_motor()
+    assert result["topic_exists"] is True
+    assert result["message_type"] == "ros_robot_controller_msgs/msg/MotorsState"
+    assert result["required_subscriber_present"] is True
+    assert result["safe_direct_motor_control"] is True
+    return result
+
+
+def test_stage10_set_motor_inspection_detects_external_direct_publisher() -> dict:
+    node = FakeRos2GraphNode(
+        topics=[
+            (
+                "/ros_robot_controller/set_motor",
+                ["ros_robot_controller_msgs/msg/MotorsState"],
+            )
+        ],
+        publisher_nodes_by_topic={
+            "/ros_robot_controller/set_motor": ["odom_publisher", "hand_gesture"]
+        },
+        subscriber_nodes_by_topic={"/ros_robot_controller/set_motor": ["ros_robot_controller"]},
+    )
+    result = MiguelHiWonderRos2GraphProbe(node=node, graph_settle_sec=0.0).inspect_direct_motor()
+    assert result["external_direct_motor_publishers"] == ["hand_gesture"]
+    assert result["safe_direct_motor_control"] is False
+    assert result["movement_tested"] is False
+    assert result["hardware_verified"] is False
+    return result
+
+
+def test_stage10_low_level_motor_chain_ok_when_required_endpoints_exist() -> dict:
+    node = FakeRos2GraphNode(
+        topics=[
+            ("/controller/cmd_vel", ["geometry_msgs/msg/Twist"]),
+            (
+                "/ros_robot_controller/set_motor",
+                ["ros_robot_controller_msgs/msg/MotorsState"],
+            ),
+        ],
+        publisher_nodes_by_topic={
+            "/controller/cmd_vel": ["miguel_hiwonder_ros2_adapter"],
+            "/ros_robot_controller/set_motor": ["odom_publisher"],
+        },
+        subscriber_nodes_by_topic={
+            "/controller/cmd_vel": ["odom_publisher"],
+            "/ros_robot_controller/set_motor": ["ros_robot_controller"],
+        },
+    )
+    probe = MiguelHiWonderRos2GraphProbe(node=node, graph_settle_sec=0.0)
+    chain = probe._build_motor_chain_readiness(probe.inspect_cmd_vel(), probe.inspect_direct_motor())
+    assert chain["cmd_vel_receiver_ok"] is True
+    assert chain["motor_receiver_ok"] is True
+    assert chain["odom_publisher_to_motor_ok"] is True
+    assert chain["low_level_motor_chain_ok"] is True
+    return chain
+
+
+def test_stage10_low_level_motor_chain_fails_when_endpoint_missing() -> dict:
+    node = FakeRos2GraphNode(
+        topics=[
+            ("/controller/cmd_vel", ["geometry_msgs/msg/Twist"]),
+            (
+                "/ros_robot_controller/set_motor",
+                ["ros_robot_controller_msgs/msg/MotorsState"],
+            ),
+        ],
+        publisher_nodes_by_topic={
+            "/controller/cmd_vel": ["miguel_hiwonder_ros2_adapter"],
+            "/ros_robot_controller/set_motor": [],
+        },
+        subscriber_nodes_by_topic={
+            "/controller/cmd_vel": ["odom_publisher"],
+            "/ros_robot_controller/set_motor": ["ros_robot_controller"],
+        },
+    )
+    probe = MiguelHiWonderRos2GraphProbe(node=node, graph_settle_sec=0.0)
+    chain = probe._build_motor_chain_readiness(probe.inspect_cmd_vel(), probe.inspect_direct_motor())
+    assert chain["cmd_vel_receiver_ok"] is True
+    assert chain["motor_receiver_ok"] is True
+    assert chain["odom_publisher_to_motor_ok"] is False
+    assert chain["low_level_motor_chain_ok"] is False
+    return chain
+
+
+def test_stage10_ros2_arm_refuses_external_direct_motor_publisher() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        report = clean_readiness_report(
+            direct_motor_safe_to_arm=False,
+            external_direct_motor_publishers=["hand_gesture"],
+        )
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(report),
+        )
+        result = adapter.arm()
+        assert result["ok"] is False
+        assert result["reason"] == "direct_motor_graph_not_safe_to_arm"
+        assert adapter.armed is False
+        assert rclpy.created_nodes[0].publishers[0].messages == []
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage10_ros2_arm_refuses_incomplete_low_level_motor_chain() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        report = clean_readiness_report(low_level_motor_chain_ok=False)
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(report),
+        )
+        result = adapter.arm()
+        assert result["ok"] is False
+        assert result["reason"] == "low_level_motor_chain_not_ready"
+        assert adapter.armed is False
+        assert rclpy.created_nodes[0].publishers[0].messages == []
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage10_ros2_arm_succeeds_with_complete_clean_motor_chain() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(clean_readiness_report()),
+        )
+        result = adapter.arm()
+        assert result["ok"] is True
+        assert adapter.armed is True
+        assert result["payload"]["low_level_motor_chain_ok"] is True
+        assert result["payload"]["external_direct_motor_publishers"] == []
+        assert rclpy.created_nodes[0].publishers[0].messages == []
+        return result
+    finally:
+        _restore_modules(saved)
+
+
+def test_stage10_movement_blocked_after_direct_motor_arm_failure() -> dict:
+    saved, rclpy = _install_fake_ros2_modules()
+    try:
+        report = clean_readiness_report(
+            direct_motor_safe_to_arm=False,
+            external_direct_motor_publishers=["hand_gesture"],
+        )
+        adapter = MiguelHiWonderRos2Adapter(
+            allow_real_ros2=True,
+            readiness_probe=FakeReadinessProbe(report),
+        )
+        arm_result = adapter.arm()
+        move_result = adapter.set_velocity("move_forward", "slow", 1.0)
+        assert arm_result["ok"] is False
+        assert move_result["ok"] is False
+        assert move_result["reason"] == "adapter_disarmed"
+        assert rclpy.created_nodes[0].publishers[0].messages == []
+        return {"arm": arm_result, "move": move_result}
+    finally:
+        _restore_modules(saved)
+
+
 def test_stage8_graph_probe_module_import_is_inert() -> dict:
-    sys.modules.pop("miguel_core.miguel_hiwonder_ros2_graph_probe", None)
-    sys.modules.pop("rclpy", None)
-    sys.modules.pop("std_msgs", None)
-    sys.modules.pop("sensor_msgs", None)
-    sys.modules.pop("nav_msgs", None)
-    importlib.import_module("miguel_core.miguel_hiwonder_ros2_graph_probe")
-    assert "rclpy" not in sys.modules
-    assert "std_msgs" not in sys.modules
-    assert "sensor_msgs" not in sys.modules
-    assert "nav_msgs" not in sys.modules
-    return {"rclpy_imported": False, "message_packages_imported": False}
+    saved = _save_and_remove_modules(
+        "miguel_core.miguel_hiwonder_ros2_graph_probe",
+        "rclpy",
+        "std_msgs",
+        "std_msgs.msg",
+        "sensor_msgs",
+        "sensor_msgs.msg",
+        "nav_msgs",
+        "nav_msgs.msg",
+    )
+    try:
+        importlib.import_module("miguel_core.miguel_hiwonder_ros2_graph_probe")
+        assert "rclpy" not in sys.modules
+        assert "std_msgs" not in sys.modules
+        assert "sensor_msgs" not in sys.modules
+        assert "nav_msgs" not in sys.modules
+        return {"rclpy_imported": False, "message_packages_imported": False}
+    finally:
+        _restore_modules(saved)
 
 
 def test_stage8_graph_probe_constructor_is_inert() -> dict:
-    sys.modules.pop("rclpy", None)
-    sys.modules.pop("std_msgs", None)
-    sys.modules.pop("sensor_msgs", None)
-    sys.modules.pop("nav_msgs", None)
-    probe = MiguelHiWonderRos2GraphProbe()
-    assert probe.node is None
-    assert probe.rclpy_module is None
-    assert "rclpy" not in sys.modules
-    assert "std_msgs" not in sys.modules
-    assert "sensor_msgs" not in sys.modules
-    assert "nav_msgs" not in sys.modules
-    return {"node": probe.node, "rclpy_module": probe.rclpy_module}
+    saved = _save_and_remove_modules(
+        "rclpy",
+        "std_msgs",
+        "std_msgs.msg",
+        "sensor_msgs",
+        "sensor_msgs.msg",
+        "nav_msgs",
+        "nav_msgs.msg",
+    )
+    try:
+        probe = MiguelHiWonderRos2GraphProbe()
+        assert probe.node is None
+        assert probe.rclpy_module is None
+        assert "rclpy" not in sys.modules
+        assert "std_msgs" not in sys.modules
+        assert "sensor_msgs" not in sys.modules
+        assert "nav_msgs" not in sys.modules
+        return {"node": probe.node, "rclpy_module": probe.rclpy_module}
+    finally:
+        _restore_modules(saved)
 
 
 def test_stage8_fake_node_list_and_topics_work() -> dict:
@@ -2145,7 +2484,7 @@ def main() -> None:
     test_stage3_ros2_nonnumeric_duration_clamps_to_zero()
     test_stage3_bridge_accepts_injected_ros2_adapter()
     test_stage31_ros2_injected_publisher_is_not_real_hardware()
-    test_stage31_ros2_allow_real_without_publisher_is_not_implemented()
+    test_stage31_ros2_real_backend_requires_explicit_opt_in()
     test_stage31_ros2_twist_factory_failure_on_movement_is_structured()
     test_stage31_ros2_twist_factory_failure_on_stop_is_structured()
     test_stage31_ros2_twist_factory_failure_on_disarm_is_structured()
@@ -2184,6 +2523,15 @@ def main() -> None:
     test_stage91_arm_succeeds_with_only_miguel_publisher_and_odom_subscriber()
     test_stage91_arm_fails_with_external_publisher_and_subscriber()
     test_stage91_arm_override_allows_external_publisher_with_subscriber()
+    test_stage10_odom_fallback_uses_odom_raw()
+    test_stage10_set_motor_inspection_detects_required_subscriber()
+    test_stage10_set_motor_inspection_detects_external_direct_publisher()
+    test_stage10_low_level_motor_chain_ok_when_required_endpoints_exist()
+    test_stage10_low_level_motor_chain_fails_when_endpoint_missing()
+    test_stage10_ros2_arm_refuses_external_direct_motor_publisher()
+    test_stage10_ros2_arm_refuses_incomplete_low_level_motor_chain()
+    test_stage10_ros2_arm_succeeds_with_complete_clean_motor_chain()
+    test_stage10_movement_blocked_after_direct_motor_arm_failure()
     test_stage8_graph_probe_module_import_is_inert()
     test_stage8_graph_probe_constructor_is_inert()
     test_stage8_fake_node_list_and_topics_work()
@@ -2194,6 +2542,7 @@ def main() -> None:
     test_stage8_odom_summary_handles_minimal_fake_odometry()
     test_stage8_sensor_failure_returns_structured_error()
     test_stage8_readiness_report_combines_graph_and_sensors()
+    _assert_no_real_ros_modules_loaded()
 
     print("\nTelemetry:")
     pprint(result["telemetry"])

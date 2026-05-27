@@ -403,6 +403,8 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
         cmd_vel = report.get("graph", {}).get("cmd_vel", {})
         if not cmd_vel and "cmd_vel" in report:
             cmd_vel = report.get("cmd_vel", {})
+        direct_motor = report.get("graph", {}).get("direct_motor", {})
+        motor_chain = report.get("graph", {}).get("motor_chain", {})
 
         topic_exists = cmd_vel.get("topic_exists")
         message_type = cmd_vel.get("message_type")
@@ -413,6 +415,19 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
             or []
         )
         cmd_vel_safe_to_arm = report.get("cmd_vel_safe_to_arm", cmd_vel.get("safe_to_arm"))
+        external_direct_motor_publishers = list(
+            report.get("external_direct_motor_publishers")
+            or direct_motor.get("external_direct_motor_publishers")
+            or []
+        )
+        direct_motor_safe_to_arm = report.get(
+            "direct_motor_safe_to_arm",
+            direct_motor.get("safe_direct_motor_control"),
+        )
+        low_level_motor_chain_ok = report.get(
+            "low_level_motor_chain_ok",
+            motor_chain.get("low_level_motor_chain_ok"),
+        )
 
         if report.get("ok") is False:
             return {
@@ -463,6 +478,36 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
                 {
                     "reason": "competing_cmd_vel_publishers_override",
                     "publishers": competing_publishers,
+                }
+            )
+        if low_level_motor_chain_ok is False:
+            return {
+                "ok": False,
+                "reason": "low_level_motor_chain_not_ready",
+                "readiness_report": report,
+                "warnings": warnings,
+            }
+        if direct_motor_safe_to_arm is False and not (
+            external_direct_motor_publishers and self.allow_competing_publishers_override
+        ):
+            return {
+                "ok": False,
+                "reason": "direct_motor_graph_not_safe_to_arm",
+                "readiness_report": report,
+                "warnings": warnings,
+            }
+        if external_direct_motor_publishers and not self.allow_competing_publishers_override:
+            return {
+                "ok": False,
+                "reason": "direct_motor_graph_not_safe_to_arm",
+                "readiness_report": report,
+                "warnings": warnings,
+            }
+        if external_direct_motor_publishers:
+            warnings.append(
+                {
+                    "reason": "external_direct_motor_publishers_override",
+                    "publishers": external_direct_motor_publishers,
                 }
             )
 

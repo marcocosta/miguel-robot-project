@@ -20,7 +20,10 @@ class MiguelHiWonderRos2GraphProbe:
     BATTERY_TOPIC = "/ros_robot_controller/battery"
     LIDAR_TOPIC = "/scan_raw"
     ODOM_TOPIC = "/odom"
+    ODOM_RAW_TOPIC = "/odom_raw"
+    DIRECT_MOTOR_TOPIC = "/ros_robot_controller/set_motor"
     EXPECTED_CMD_VEL_TYPE = "geometry_msgs/msg/Twist"
+    EXPECTED_DIRECT_MOTOR_TYPE = "ros_robot_controller_msgs/msg/MotorsState"
     MIGUEL_NODE_NAMES = {
         "miguel_hiwonder_ros2_adapter",
         "miguel_hiwonder_ros2_probe",
@@ -181,6 +184,62 @@ class MiguelHiWonderRos2GraphProbe:
             result.update(self._result(ok=False, reason="ros2_probe_error", error=str(exc)))
             return result
 
+    def inspect_direct_motor(
+        self,
+        graph_settle_sec: float | None = None,
+    ) -> dict:
+        node_result = self._ensure_node()
+        if not node_result["ok"]:
+            result = self._direct_motor_base()
+            result.update(node_result)
+            return result
+        try:
+            self._settle_graph(graph_settle_sec)
+            topics_result = self.list_topics()
+            topics = topics_result.get("topics", {}) if topics_result.get("ok") else {}
+            topic_types = topics.get(self.DIRECT_MOTOR_TOPIC, [])
+            message_type = topic_types[0] if topic_types else None
+            topic_exists = self.DIRECT_MOTOR_TOPIC in topics
+            publisher_nodes = self._topic_endpoint_nodes(self.DIRECT_MOTOR_TOPIC, "publishers")
+            subscriber_nodes = self._topic_endpoint_nodes(self.DIRECT_MOTOR_TOPIC, "subscribers")
+            raw_publisher_count = self._count_publishers(self.DIRECT_MOTOR_TOPIC)
+            raw_subscription_count = self._count_subscribers(self.DIRECT_MOTOR_TOPIC)
+            publisher_count = max(raw_publisher_count, len(publisher_nodes))
+            subscription_count = max(raw_subscription_count, len(subscriber_nodes))
+
+            external_publishers = [
+                name for name in publisher_nodes
+                if not self._is_direct_motor_allowed_publisher(name)
+            ]
+            unknown_count = max(0, publisher_count - len(publisher_nodes))
+            if unknown_count:
+                external_publishers.extend(["unknown"] * unknown_count)
+            required_subscriber_present = self._has_endpoint_node(
+                subscriber_nodes,
+                "ros_robot_controller",
+            )
+            safe_direct_motor_control = len(external_publishers) == 0
+            return self._result(
+                ok=True,
+                topic=self.DIRECT_MOTOR_TOPIC,
+                topic_exists=topic_exists,
+                message_type=message_type,
+                publisher_count=publisher_count,
+                subscription_count=subscription_count,
+                publisher_nodes=publisher_nodes,
+                subscriber_nodes=subscriber_nodes,
+                required_subscriber_present=required_subscriber_present,
+                external_direct_motor_publishers=external_publishers,
+                safe_direct_motor_control=safe_direct_motor_control,
+                movement_tested=False,
+                hardware_verified=False,
+                reason="ok",
+            )
+        except Exception as exc:
+            result = self._direct_motor_base()
+            result.update(self._result(ok=False, reason="ros2_probe_error", error=str(exc)))
+            return result
+
     def read_battery_once(self, timeout_sec: float = 2.0) -> dict:
         try:
             msg_module = importlib.import_module("std_msgs.msg")
@@ -236,15 +295,22 @@ class MiguelHiWonderRos2GraphProbe:
     def read_odom_once(self, timeout_sec: float = 2.0) -> dict:
         try:
             msg_module = importlib.import_module("nav_msgs.msg")
-            msg = self._read_one_message(msg_module.Odometry, self.ODOM_TOPIC, timeout_sec)
+            primary = self._read_one_message(msg_module.Odometry, self.ODOM_TOPIC, timeout_sec)
+            msg = primary
+            if not primary["ok"]:
+                fallback = self._read_one_message(msg_module.Odometry, self.ODOM_RAW_TOPIC, timeout_sec)
+                msg = fallback if fallback["ok"] else primary
             if not msg["ok"]:
-                return self._sensor_error("odom", msg)
+                error = self._sensor_error("odom", msg)
+                error["selected_topic"] = None
+                return error
             summary = self._summarize_odom(msg["message"])
             return self._result(
                 ok=True,
                 readable=True,
                 sensor="odom",
-                topic=self.ODOM_TOPIC,
+                topic=msg.get("topic"),
+                selected_topic=msg.get("topic"),
                 reason="ok",
                 **summary,
             )
@@ -262,15 +328,19 @@ class MiguelHiWonderRos2GraphProbe:
         nodes = self.list_nodes()
         topics = self.list_topics()
         cmd_vel = self.inspect_cmd_vel()
+        direct_motor = self.inspect_direct_motor()
+        motor_chain = self._build_motor_chain_readiness(cmd_vel, direct_motor)
         battery = self.read_battery_once()
         lidar = self.read_lidar_once()
         odom = self.read_odom_once()
         topic_map = topics.get("topics", {}) if topics.get("ok") else {}
         expected_topics = {
             self.expected_cmd_vel_topic,
+            self.DIRECT_MOTOR_TOPIC,
             self.BATTERY_TOPIC,
             self.LIDAR_TOPIC,
             self.ODOM_TOPIC,
+            self.ODOM_RAW_TOPIC,
         }
         car_graph_visible = bool(topic_map) and any(topic in topic_map for topic in expected_topics)
         ros2_available = bool(nodes.get("ok") or topics.get("ok"))
@@ -280,15 +350,25 @@ class MiguelHiWonderRos2GraphProbe:
             car_graph_visible=car_graph_visible,
             cmd_vel_safe_to_arm=cmd_vel.get("safe_to_arm", False),
             competing_cmd_vel_publishers=cmd_vel.get("competing_publishers", []),
+            low_level_motor_chain_ok=motor_chain.get("low_level_motor_chain_ok", False),
+            direct_motor_safe_to_arm=direct_motor.get("safe_direct_motor_control", False),
+            external_direct_motor_publishers=direct_motor.get("external_direct_motor_publishers", []),
             battery_ok=battery.get("ok", False),
             battery_readable=battery.get("readable", False),
             lidar_ok=lidar.get("ok", False),
             lidar_readable=lidar.get("readable", False),
             odom_ok=odom.get("ok", False),
             odom_readable=odom.get("readable", False),
+            selected_odom_topic=odom.get("selected_topic"),
             movement_tested=False,
             hardware_verified=False,
-            graph={"nodes": nodes, "topics": topics, "cmd_vel": cmd_vel},
+            graph={
+                "nodes": nodes,
+                "topics": topics,
+                "cmd_vel": cmd_vel,
+                "direct_motor": direct_motor,
+                "motor_chain": motor_chain,
+            },
             sensors={"battery": battery, "lidar": lidar, "odom": odom},
             reason="ok",
         )
@@ -509,6 +589,47 @@ class MiguelHiWonderRos2GraphProbe:
             "hardware_verified": False,
         }
 
+    def _direct_motor_base(self) -> dict:
+        return {
+            "topic": self.DIRECT_MOTOR_TOPIC,
+            "topic_exists": False,
+            "message_type": None,
+            "publisher_count": 0,
+            "subscription_count": 0,
+            "publisher_nodes": [],
+            "subscriber_nodes": [],
+            "required_subscriber_present": False,
+            "external_direct_motor_publishers": [],
+            "safe_direct_motor_control": False,
+            "movement_tested": False,
+            "hardware_verified": False,
+        }
+
+    def _build_motor_chain_readiness(self, cmd_vel: dict, direct_motor: dict) -> dict:
+        cmd_vel_subscribers = list(cmd_vel.get("subscriber_nodes") or [])
+        motor_publishers = list(direct_motor.get("publisher_nodes") or [])
+        cmd_vel_receiver_ok = self._has_endpoint_node(cmd_vel_subscribers, "odom_publisher")
+        motor_receiver_ok = self._has_endpoint_node(
+            list(direct_motor.get("subscriber_nodes") or []),
+            "ros_robot_controller",
+        )
+        odom_publisher_to_motor_ok = self._has_endpoint_node(motor_publishers, "odom_publisher")
+        low_level_motor_chain_ok = (
+            cmd_vel_receiver_ok
+            and motor_receiver_ok
+            and odom_publisher_to_motor_ok
+        )
+        return self._result(
+            ok=True,
+            cmd_vel_receiver_ok=cmd_vel_receiver_ok,
+            motor_receiver_ok=motor_receiver_ok,
+            odom_publisher_to_motor_ok=odom_publisher_to_motor_ok,
+            low_level_motor_chain_ok=low_level_motor_chain_ok,
+            movement_tested=False,
+            hardware_verified=False,
+            reason="ok",
+        )
+
     def _sensor_error(self, sensor: str, message_result: dict) -> dict:
         return self._result(
             ok=False,
@@ -528,6 +649,14 @@ class MiguelHiWonderRos2GraphProbe:
     def _is_ignored_publisher(self, name: str, ignored_names: set[str]) -> bool:
         normalized = self._normalize_node_name(name)
         return normalized in ignored_names or self._is_miguel_node(name)
+
+    def _is_direct_motor_allowed_publisher(self, name: str) -> bool:
+        normalized = self._normalize_node_name(name)
+        return normalized == "odom_publisher" or self._is_miguel_node(name)
+
+    def _has_endpoint_node(self, names: list[str], expected: str) -> bool:
+        normalized_expected = self._normalize_node_name(expected)
+        return any(self._normalize_node_name(name) == normalized_expected for name in names)
 
     @staticmethod
     def _normalize_node_name(name: object) -> str:
