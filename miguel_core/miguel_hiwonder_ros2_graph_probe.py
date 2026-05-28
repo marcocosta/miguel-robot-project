@@ -324,6 +324,111 @@ class MiguelHiWonderRos2GraphProbe:
                 error=str(exc),
             )
 
+    def observe_cmd_vel_quiet_once(self, timeout_sec: float = 5.0) -> dict:
+        """Read-only quiet check for external cmd_vel publishers."""
+        try:
+            msg_module = importlib.import_module("geometry_msgs.msg")
+            msg = self._read_one_message(msg_module.Twist, self.expected_cmd_vel_topic, timeout_sec)
+            observed_message = bool(msg.get("ok"))
+            if observed_message:
+                return self._result(
+                    ok=True,
+                    observed_message=True,
+                    quiet=False,
+                    timeout_sec=float(timeout_sec),
+                    topic=self.expected_cmd_vel_topic,
+                    reason="message_observed",
+                    movement_tested=False,
+                    hardware_verified=False,
+                )
+            if msg.get("reason") == "timeout":
+                return self._result(
+                    ok=True,
+                    observed_message=False,
+                    quiet=True,
+                    timeout_sec=float(timeout_sec),
+                    topic=self.expected_cmd_vel_topic,
+                    reason="timeout",
+                    movement_tested=False,
+                    hardware_verified=False,
+                )
+            return self._result(
+                ok=False,
+                observed_message=False,
+                quiet=False,
+                timeout_sec=float(timeout_sec),
+                topic=self.expected_cmd_vel_topic,
+                reason=msg.get("reason", "ros2_probe_error"),
+                error=msg.get("error"),
+                movement_tested=False,
+                hardware_verified=False,
+            )
+        except Exception as exc:
+            return self._result(
+                ok=False,
+                observed_message=False,
+                quiet=False,
+                timeout_sec=float(timeout_sec),
+                topic=self.expected_cmd_vel_topic,
+                reason="ros2_probe_error",
+                error=str(exc),
+                movement_tested=False,
+                hardware_verified=False,
+            )
+
+    def observe_odom_stationary(self, timeout_sec: float = 5.0, gap_sec: float = 2.0) -> dict:
+        """Read two odometry samples and report whether twist remains stationary."""
+        try:
+            msg_module = importlib.import_module("nav_msgs.msg")
+            first = self._read_odom_message_once(msg_module.Odometry, timeout_sec)
+            if not first.get("ok"):
+                return self._odom_stationary_error(first, timeout_sec, gap_sec)
+
+            gap = max(0.0, float(gap_sec or 0.0))
+            if gap:
+                time.sleep(gap)
+
+            selected_topic = first.get("topic")
+            second = self._read_one_message(msg_module.Odometry, str(selected_topic), timeout_sec)
+            if not second.get("ok"):
+                return self._odom_stationary_error(second, timeout_sec, gap_sec, selected_topic)
+
+            first_twist = self._summarize_odom_twist(first.get("message"))
+            second_twist = self._summarize_odom_twist(second.get("message"))
+            max_abs_linear = self._max_abs_twist_component(first_twist, second_twist, "linear")
+            max_abs_angular = self._max_abs_twist_component(first_twist, second_twist, "angular")
+            stationary = max_abs_linear == 0.0 and max_abs_angular == 0.0
+            return self._result(
+                ok=True,
+                selected_topic=selected_topic,
+                stationary=stationary,
+                first_twist=first_twist,
+                second_twist=second_twist,
+                max_abs_linear=max_abs_linear,
+                max_abs_angular=max_abs_angular,
+                timeout_sec=float(timeout_sec),
+                gap_sec=float(gap_sec),
+                reason="ok" if stationary else "odom_twist_nonzero",
+                movement_tested=False,
+                hardware_verified=False,
+            )
+        except Exception as exc:
+            return self._result(
+                ok=False,
+                selected_topic=None,
+                stationary=False,
+                first_twist=None,
+                second_twist=None,
+                max_abs_linear=None,
+                max_abs_angular=None,
+                timeout_sec=float(timeout_sec),
+                gap_sec=float(gap_sec),
+                reason="ros2_probe_error",
+                error=str(exc),
+                movement_tested=False,
+                hardware_verified=False,
+            )
+
     def build_readiness_report(self) -> dict:
         nodes = self.list_nodes()
         topics = self.list_topics()
@@ -373,6 +478,46 @@ class MiguelHiWonderRos2GraphProbe:
             reason="ok",
         )
 
+    def build_inactive_publisher_readiness_report(
+        self,
+        cmd_vel_quiet_timeout_sec: float = 5.0,
+        odom_timeout_sec: float = 5.0,
+        odom_gap_sec: float = 2.0,
+    ) -> dict:
+        readiness = self.build_readiness_report()
+        cmd_vel_quiet = self.observe_cmd_vel_quiet_once(cmd_vel_quiet_timeout_sec)
+        odom_stationary = self.observe_odom_stationary(odom_timeout_sec, odom_gap_sec)
+        known_external_publishers = list(readiness.get("competing_cmd_vel_publishers") or [])
+        direct_motor_publishers = list(readiness.get("external_direct_motor_publishers") or [])
+        direct_motor_blocking = bool(direct_motor_publishers)
+        inactive_publishers_observed = (
+            cmd_vel_quiet.get("ok") is True
+            and cmd_vel_quiet.get("quiet") is True
+            and odom_stationary.get("ok") is True
+            and odom_stationary.get("stationary") is True
+        )
+        relaxed_safe_to_arm = (
+            inactive_publishers_observed
+            and readiness.get("low_level_motor_chain_ok") is True
+            and not direct_motor_blocking
+        )
+        report = dict(readiness)
+        report.update(
+            {
+                "normal_readiness_report": readiness,
+                "cmd_vel_quiet": cmd_vel_quiet,
+                "odom_stationary": odom_stationary,
+                "known_external_publishers": known_external_publishers,
+                "direct_motor_publishers": direct_motor_publishers,
+                "inactive_publishers_observed": inactive_publishers_observed,
+                "direct_motor_blocking": direct_motor_blocking,
+                "relaxed_safe_to_arm": relaxed_safe_to_arm,
+                "movement_tested": False,
+                "hardware_verified": False,
+            }
+        )
+        return report
+
     def _get_rclpy(self) -> object:
         if self.rclpy_module is None:
             self.rclpy_module = importlib.import_module("rclpy")
@@ -397,10 +542,15 @@ class MiguelHiWonderRos2GraphProbe:
         try:
             subscription = self.node.create_subscription(msg_type, topic, callback, 10)
             deadline = time.monotonic() + max(0.0, float(timeout_sec))
-            rclpy = self._get_rclpy()
             while not received and time.monotonic() <= deadline:
-                if hasattr(rclpy, "spin_once"):
-                    rclpy.spin_once(self.node, timeout_sec=0.05)
+                if hasattr(self.node, "spin_once"):
+                    self.node.spin_once()
+                elif self.rclpy_module is not None or self._owned_node:
+                    rclpy = self._get_rclpy()
+                    if hasattr(rclpy, "spin_once"):
+                        rclpy.spin_once(self.node, timeout_sec=0.05)
+                    else:
+                        break
                 else:
                     break
             if not received:
@@ -414,6 +564,13 @@ class MiguelHiWonderRos2GraphProbe:
                     self.node.destroy_subscription(subscription)
             except Exception:
                 pass
+
+    def _read_odom_message_once(self, msg_type: object, timeout_sec: float) -> dict:
+        primary = self._read_one_message(msg_type, self.ODOM_TOPIC, timeout_sec)
+        if primary.get("ok"):
+            return primary
+        fallback = self._read_one_message(msg_type, self.ODOM_RAW_TOPIC, timeout_sec)
+        return fallback if fallback.get("ok") else primary
 
     def _count_publishers(self, topic: str) -> int:
         if hasattr(self.node, "count_publishers"):
@@ -463,6 +620,18 @@ class MiguelHiWonderRos2GraphProbe:
         except (TypeError, ValueError):
             settle = 0.0
         if settle <= 0.0 or self.node is None:
+            return
+        if hasattr(self.node, "spin_once"):
+            deadline = time.monotonic() + settle
+            while time.monotonic() <= deadline:
+                try:
+                    self.node.spin_once()
+                except Exception:
+                    return
+                time.sleep(min(0.05, settle))
+            return
+        if self.rclpy_module is None and not self._owned_node:
+            time.sleep(settle)
             return
         try:
             rclpy = self._get_rclpy()
@@ -539,6 +708,55 @@ class MiguelHiWonderRos2GraphProbe:
             "frame_id": getattr(header, "frame_id", None),
             "child_frame_id": getattr(odom, "child_frame_id", None),
         }
+
+    def _summarize_odom_twist(self, odom: object) -> dict:
+        twist = getattr(getattr(odom, "twist", None), "twist", None)
+        linear = getattr(twist, "linear", None)
+        angular = getattr(twist, "angular", None)
+        return {
+            "linear": {
+                "x": self._number_or_none(getattr(linear, "x", None)),
+                "y": self._number_or_none(getattr(linear, "y", None)),
+                "z": self._number_or_none(getattr(linear, "z", None)),
+            },
+            "angular": {
+                "x": self._number_or_none(getattr(angular, "x", None)),
+                "y": self._number_or_none(getattr(angular, "y", None)),
+                "z": self._number_or_none(getattr(angular, "z", None)),
+            },
+        }
+
+    @staticmethod
+    def _max_abs_twist_component(first_twist: dict, second_twist: dict, group: str) -> float:
+        values = []
+        for twist in (first_twist, second_twist):
+            for value in (twist.get(group) or {}).values():
+                if isinstance(value, (int, float)):
+                    values.append(abs(float(value)))
+        return max(values, default=0.0)
+
+    def _odom_stationary_error(
+        self,
+        message_result: dict,
+        timeout_sec: float,
+        gap_sec: float,
+        selected_topic: str | None = None,
+    ) -> dict:
+        return self._result(
+            ok=False,
+            selected_topic=selected_topic,
+            stationary=False,
+            first_twist=None,
+            second_twist=None,
+            max_abs_linear=None,
+            max_abs_angular=None,
+            timeout_sec=float(timeout_sec),
+            gap_sec=float(gap_sec),
+            reason=message_result.get("reason", "ros2_probe_error"),
+            error=message_result.get("error"),
+            movement_tested=False,
+            hardware_verified=False,
+        )
 
     @staticmethod
     def _yaw_from_quaternion(orientation: object) -> float | None:

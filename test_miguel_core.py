@@ -147,12 +147,89 @@ def clean_readiness_report(**overrides: object) -> dict:
     return report
 
 
+def inactive_readiness_report(**overrides: object) -> dict:
+    report = clean_readiness_report(
+        cmd_vel_safe_to_arm=False,
+        competing_cmd_vel_publishers=["lidar_app"],
+        graph={
+            "cmd_vel": {
+                "topic": "/controller/cmd_vel",
+                "topic_exists": True,
+                "message_type": "geometry_msgs/msg/Twist",
+                "publisher_count": 1,
+                "subscription_count": 1,
+                "publisher_nodes": ["lidar_app"],
+                "subscriber_nodes": ["odom_publisher"],
+                "competing_publishers": ["lidar_app"],
+                "safe_to_arm": False,
+            },
+            "direct_motor": {
+                "topic": "/ros_robot_controller/set_motor",
+                "topic_exists": True,
+                "message_type": "ros_robot_controller_msgs/msg/MotorsState",
+                "publisher_count": 1,
+                "subscription_count": 1,
+                "publisher_nodes": ["odom_publisher"],
+                "subscriber_nodes": ["ros_robot_controller"],
+                "required_subscriber_present": True,
+                "external_direct_motor_publishers": [],
+                "safe_direct_motor_control": True,
+            },
+            "motor_chain": {
+                "cmd_vel_receiver_ok": True,
+                "motor_receiver_ok": True,
+                "odom_publisher_to_motor_ok": True,
+                "low_level_motor_chain_ok": True,
+            },
+        },
+        cmd_vel_quiet={
+            "ok": True,
+            "observed_message": False,
+            "quiet": True,
+            "timeout_sec": 5.0,
+            "topic": "/controller/cmd_vel",
+            "reason": "timeout",
+            "movement_tested": False,
+            "hardware_verified": False,
+        },
+        odom_stationary={
+            "ok": True,
+            "selected_topic": "/odom_raw",
+            "stationary": True,
+            "first_twist": {
+                "linear": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "angular": {"x": 0.0, "y": 0.0, "z": 0.0},
+            },
+            "second_twist": {
+                "linear": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "angular": {"x": 0.0, "y": 0.0, "z": 0.0},
+            },
+            "max_abs_linear": 0.0,
+            "max_abs_angular": 0.0,
+            "reason": "ok",
+        },
+        known_external_publishers=["lidar_app"],
+        direct_motor_publishers=[],
+        inactive_publishers_observed=True,
+        direct_motor_blocking=False,
+        relaxed_safe_to_arm=True,
+    )
+    report.update(overrides)
+    return report
+
+
 class FakeReadinessProbe:
     def __init__(self, report: dict) -> None:
         self.report = report
         self.calls = 0
 
     def build_readiness_report(self) -> dict:
+        self.calls += 1
+        return dict(self.report)
+
+
+class FakeInactiveReadinessProbe(FakeReadinessProbe):
+    def build_inactive_publisher_readiness_report(self) -> dict:
         self.calls += 1
         return dict(self.report)
 
@@ -260,6 +337,8 @@ class FakeRos2GraphNode:
 
     def destroy_subscription(self, subscription: object) -> None:
         self.destroyed_subscriptions.append(subscription)
+        if subscription in self.subscriptions:
+            self.subscriptions.remove(subscription)
 
     def spin_once(self) -> None:
         for subscription in list(self.subscriptions):
@@ -315,7 +394,11 @@ class FakeQuaternion:
 
 
 class FakeOdometry:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        linear: tuple[float, float, float] = (0.12, 0.01, 0.0),
+        angular: tuple[float, float, float] = (0.0, 0.0, -0.2),
+    ) -> None:
         self.header = FakeHeader("odom")
         self.child_frame_id = "base_link"
         self.pose = types.SimpleNamespace(
@@ -326,8 +409,8 @@ class FakeOdometry:
         )
         self.twist = types.SimpleNamespace(
             twist=types.SimpleNamespace(
-                linear=FakeVector3(0.12, 0.01, 0.0),
-                angular=FakeVector3(0.0, 0.0, -0.2),
+                linear=FakeVector3(*linear),
+                angular=FakeVector3(*angular),
             )
         )
 
@@ -463,7 +546,45 @@ def _install_fake_graph_ros2_modules(node: FakeRos2GraphNode) -> tuple[dict[str,
     return saved, rclpy
 
 
+def _install_stage11_ros_sensitive_import_guard() -> dict[str, object]:
+    fake_modules = _make_fake_ros2_modules()
+    saved = {
+        "__import_module__": importlib.import_module,
+        "__ros_modules__": _snapshot_ros_modules(),
+    }
+    for name in list(sys.modules):
+        if _is_ros_test_module(name):
+            sys.modules.pop(name, None)
+    for name, module in fake_modules.items():
+        if name != "rclpy":
+            sys.modules[name] = module
+
+    def guarded_import_module(name: str, *args: object, **kwargs: object) -> object:
+        if name == "rclpy" or name.startswith("rclpy."):
+            raise AssertionError(f"Stage 11 test attempted host ROS import: {name}")
+        if _is_ros_test_module(name):
+            if name in fake_modules and name != "rclpy":
+                return fake_modules[name]
+            raise AssertionError(f"Stage 11 test attempted non-fake ROS import: {name}")
+        return saved["__import_module__"](name, *args, **kwargs)
+
+    graph_probe_module = sys.modules[MiguelHiWonderRos2GraphProbe.__module__]
+    adapter_module = sys.modules[MiguelHiWonderRos2Adapter.__module__]
+    saved["__graph_import_module__"] = graph_probe_module.importlib.import_module
+    saved["__adapter_import_module__"] = adapter_module.importlib.import_module
+    graph_probe_module.importlib.import_module = guarded_import_module
+    adapter_module.importlib.import_module = guarded_import_module
+    return saved
+
+
 def _restore_modules(saved: dict[str, object]) -> None:
+    graph_import_module = saved.get("__graph_import_module__")
+    if graph_import_module is not None:
+        sys.modules[MiguelHiWonderRos2GraphProbe.__module__].importlib.import_module = graph_import_module
+    adapter_import_module = saved.get("__adapter_import_module__")
+    if adapter_import_module is not None:
+        sys.modules[MiguelHiWonderRos2Adapter.__module__].importlib.import_module = adapter_import_module
+
     original_import_module = saved.get("__import_module__")
     if original_import_module is not None:
         importlib.import_module = original_import_module
@@ -504,6 +625,19 @@ def _assert_no_real_ros_modules_loaded() -> None:
             if not getattr(module, "_miguel_fake_ros2_module", False):
                 offenders.append(name)
     assert offenders == [], f"unit tests imported host ROS modules: {offenders[:8]}"
+
+
+def _destroy_adapter_node_without_publish(adapter: object) -> None:
+    node = getattr(adapter, "node", None)
+    if node is not None and hasattr(node, "destroy_node"):
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+    if hasattr(adapter, "_owned_node"):
+        adapter._owned_node = False
+    if hasattr(adapter, "node"):
+        adapter.node = None
 
 
 def _runtime() -> MiguelRuntime:
@@ -2198,6 +2332,268 @@ def test_stage10_movement_blocked_after_direct_motor_arm_failure() -> dict:
         _restore_modules(saved)
 
 
+def test_stage11_cmd_vel_quiet_returns_true_on_timeout() -> dict:
+    node = FakeRos2GraphNode()
+    saved = _install_stage11_ros_sensitive_import_guard()
+    probe = MiguelHiWonderRos2GraphProbe(node=node, graph_settle_sec=0.0)
+    try:
+        result = probe.observe_cmd_vel_quiet_once(timeout_sec=0.01)
+    finally:
+        probe.destroy_node()
+        node.destroy_node()
+        _restore_modules(saved)
+    assert result["ok"] is True
+    assert result["observed_message"] is False
+    assert result["quiet"] is True
+    assert result["topic"] == "/controller/cmd_vel"
+    assert result["movement_tested"] is False
+    assert result["hardware_verified"] is False
+    return result
+
+
+def test_stage11_cmd_vel_quiet_returns_false_when_message_observed() -> dict:
+    node = FakeRos2GraphNode(messages_by_topic={"/controller/cmd_vel": [FakeRos2Twist()]})
+    saved = _install_stage11_ros_sensitive_import_guard()
+    probe = MiguelHiWonderRos2GraphProbe(node=node, graph_settle_sec=0.0)
+    try:
+        result = probe.observe_cmd_vel_quiet_once(timeout_sec=0.01)
+    finally:
+        probe.destroy_node()
+        node.destroy_node()
+        _restore_modules(saved)
+    assert result["ok"] is True
+    assert result["observed_message"] is True
+    assert result["quiet"] is False
+    assert result["reason"] == "message_observed"
+    return result
+
+
+def test_stage11_odom_stationary_true_for_zero_twist_samples() -> dict:
+    zero = (0.0, 0.0, 0.0)
+    node = FakeRos2GraphNode(messages_by_topic={"/odom": [FakeOdometry(zero, zero), FakeOdometry(zero, zero)]})
+    saved = _install_stage11_ros_sensitive_import_guard()
+    probe = MiguelHiWonderRos2GraphProbe(node=node, graph_settle_sec=0.0)
+    try:
+        result = probe.observe_odom_stationary(timeout_sec=0.01, gap_sec=0.0)
+    finally:
+        probe.destroy_node()
+        node.destroy_node()
+        _restore_modules(saved)
+    assert result["ok"] is True
+    assert result["selected_topic"] == "/odom"
+    assert result["stationary"] is True
+    assert result["max_abs_linear"] == 0.0
+    assert result["max_abs_angular"] == 0.0
+    return result
+
+
+def test_stage11_odom_stationary_false_for_nonzero_second_sample() -> dict:
+    zero = (0.0, 0.0, 0.0)
+    node = FakeRos2GraphNode(
+        messages_by_topic={
+            "/odom": [
+                FakeOdometry(zero, zero),
+                FakeOdometry((0.05, 0.0, 0.0), zero),
+            ]
+        }
+    )
+    saved = _install_stage11_ros_sensitive_import_guard()
+    probe = MiguelHiWonderRos2GraphProbe(node=node, graph_settle_sec=0.0)
+    try:
+        result = probe.observe_odom_stationary(timeout_sec=0.01, gap_sec=0.0)
+    finally:
+        probe.destroy_node()
+        node.destroy_node()
+        _restore_modules(saved)
+    assert result["ok"] is True
+    assert result["stationary"] is False
+    assert result["max_abs_linear"] == 0.05
+    assert result["reason"] == "odom_twist_nonzero"
+    return result
+
+
+def test_stage11_inactive_readiness_reports_hand_gesture_direct_motor_blocking() -> dict:
+    zero = (0.0, 0.0, 0.0)
+    node = FakeRos2GraphNode(
+        nodes=["/controller", "/odom_publisher"],
+        topics=[
+            ("/controller/cmd_vel", ["geometry_msgs/msg/Twist"]),
+            ("/ros_robot_controller/set_motor", ["ros_robot_controller_msgs/msg/MotorsState"]),
+            ("/ros_robot_controller/battery", ["std_msgs/msg/UInt16"]),
+            ("/scan_raw", ["sensor_msgs/msg/LaserScan"]),
+            ("/odom_raw", ["nav_msgs/msg/Odometry"]),
+        ],
+        publisher_nodes_by_topic={
+            "/controller/cmd_vel": ["lidar_app"],
+            "/ros_robot_controller/set_motor": ["odom_publisher", "hand_gesture"],
+        },
+        subscriber_nodes_by_topic={
+            "/controller/cmd_vel": ["odom_publisher"],
+            "/ros_robot_controller/set_motor": ["ros_robot_controller"],
+        },
+        messages_by_topic={
+            "/ros_robot_controller/battery": [FakeUInt16(7424)],
+            "/scan_raw": [FakeLaserScan([1.0], angle_min=0.0, angle_increment=0.1)],
+            "/odom_raw": [FakeOdometry(zero, zero), FakeOdometry(zero, zero), FakeOdometry(zero, zero)],
+        },
+    )
+    saved = _install_stage11_ros_sensitive_import_guard()
+    probe = MiguelHiWonderRos2GraphProbe(node=node, graph_settle_sec=0.0)
+    try:
+        result = probe.build_inactive_publisher_readiness_report(
+            cmd_vel_quiet_timeout_sec=0.01,
+            odom_timeout_sec=0.01,
+            odom_gap_sec=0.0,
+        )
+    finally:
+        probe.destroy_node()
+        node.destroy_node()
+        _restore_modules(saved)
+    assert result["cmd_vel_quiet"]["quiet"] is True
+    assert result["odom_stationary"]["stationary"] is True
+    assert result["inactive_publishers_observed"] is True
+    assert result["direct_motor_publishers"] == ["hand_gesture"]
+    assert result["direct_motor_blocking"] is True
+    assert result["relaxed_safe_to_arm"] is False
+    return result
+
+
+def test_stage11_adapter_blocks_external_cmd_vel_by_default() -> dict:
+    saved = _install_stage11_ros_sensitive_import_guard()
+    publisher = FakeTwistPublisher()
+    adapter = None
+    try:
+        adapter = MiguelHiWonderRos2Adapter(
+            publisher=publisher,
+            readiness_probe=FakeInactiveReadinessProbe(inactive_readiness_report()),
+        )
+        result = adapter.arm()
+        assert result["ok"] is False
+        assert result["reason"] == "ros2_graph_not_safe_to_arm"
+        assert adapter.armed is False
+        assert publisher.payloads == []
+        return result
+    finally:
+        if adapter is not None:
+            _destroy_adapter_node_without_publish(adapter)
+        _restore_modules(saved)
+
+
+def test_stage11_adapter_inactive_external_cmd_vel_opt_in_can_pass_without_direct_publishers() -> dict:
+    saved = _install_stage11_ros_sensitive_import_guard()
+    publisher = FakeTwistPublisher()
+    adapter = None
+    try:
+        adapter = MiguelHiWonderRos2Adapter(
+            publisher=publisher,
+            readiness_probe=FakeInactiveReadinessProbe(inactive_readiness_report()),
+            allow_inactive_external_cmd_vel_publishers=True,
+        )
+        result = adapter.arm()
+        assert result["ok"] is True
+        assert adapter.armed is True
+        assert result["params"]["readiness_warnings"][0]["reason"] == "inactive_external_cmd_vel_publishers_observed"
+        assert publisher.payloads == []
+        return result
+    finally:
+        if adapter is not None:
+            _destroy_adapter_node_without_publish(adapter)
+        _restore_modules(saved)
+
+
+def test_stage11_adapter_blocks_hand_gesture_direct_motor_without_direct_override() -> dict:
+    saved = _install_stage11_ros_sensitive_import_guard()
+    publisher = FakeTwistPublisher()
+    adapter = None
+    try:
+        report = inactive_readiness_report(
+            direct_motor_safe_to_arm=False,
+            external_direct_motor_publishers=["hand_gesture"],
+            direct_motor_publishers=["hand_gesture"],
+            direct_motor_blocking=True,
+            relaxed_safe_to_arm=False,
+        )
+        adapter = MiguelHiWonderRos2Adapter(
+            publisher=publisher,
+            readiness_probe=FakeInactiveReadinessProbe(report),
+            allow_inactive_external_cmd_vel_publishers=True,
+        )
+        result = adapter.arm()
+        assert result["ok"] is False
+        assert result["reason"] == "direct_motor_graph_not_safe_to_arm"
+        assert adapter.armed is False
+        assert publisher.payloads == []
+        return result
+    finally:
+        if adapter is not None:
+            _destroy_adapter_node_without_publish(adapter)
+        _restore_modules(saved)
+
+
+def test_stage11_adapter_allows_hand_gesture_only_with_direct_override() -> dict:
+    saved = _install_stage11_ros_sensitive_import_guard()
+    publisher = FakeTwistPublisher()
+    adapter = None
+    try:
+        report = inactive_readiness_report(
+            direct_motor_safe_to_arm=False,
+            external_direct_motor_publishers=["hand_gesture"],
+            direct_motor_publishers=["hand_gesture"],
+            direct_motor_blocking=True,
+            relaxed_safe_to_arm=False,
+        )
+        adapter = MiguelHiWonderRos2Adapter(
+            publisher=publisher,
+            readiness_probe=FakeInactiveReadinessProbe(report),
+            allow_inactive_external_cmd_vel_publishers=True,
+            allow_external_direct_motor_publishers_override=True,
+        )
+        result = adapter.arm()
+        assert result["ok"] is True
+        assert adapter.armed is True
+        assert publisher.payloads == []
+        return result
+    finally:
+        if adapter is not None:
+            _destroy_adapter_node_without_publish(adapter)
+        _restore_modules(saved)
+
+
+def test_stage11_movement_blocked_after_inactive_arm_failure() -> dict:
+    saved = _install_stage11_ros_sensitive_import_guard()
+    publisher = FakeTwistPublisher()
+    adapter = None
+    try:
+        report = inactive_readiness_report(
+            cmd_vel_quiet={
+                "ok": True,
+                "observed_message": True,
+                "quiet": False,
+                "topic": "/controller/cmd_vel",
+                "reason": "message_observed",
+            },
+            inactive_publishers_observed=False,
+            relaxed_safe_to_arm=False,
+        )
+        adapter = MiguelHiWonderRos2Adapter(
+            publisher=publisher,
+            readiness_probe=FakeInactiveReadinessProbe(report),
+            allow_inactive_external_cmd_vel_publishers=True,
+        )
+        arm_result = adapter.arm()
+        move_result = adapter.set_velocity("move_forward", "slow", 1.0)
+        assert arm_result["ok"] is False
+        assert arm_result["reason"] == "inactive_publisher_readiness_failed"
+        assert move_result["ok"] is False
+        assert move_result["reason"] == "adapter_disarmed"
+        assert publisher.payloads == []
+        return {"arm": arm_result, "move": move_result}
+    finally:
+        if adapter is not None:
+            _destroy_adapter_node_without_publish(adapter)
+        _restore_modules(saved)
+
+
 def test_stage8_graph_probe_module_import_is_inert() -> dict:
     saved = _save_and_remove_modules(
         "miguel_core.miguel_hiwonder_ros2_graph_probe",
@@ -2532,6 +2928,16 @@ def main() -> None:
     test_stage10_ros2_arm_refuses_incomplete_low_level_motor_chain()
     test_stage10_ros2_arm_succeeds_with_complete_clean_motor_chain()
     test_stage10_movement_blocked_after_direct_motor_arm_failure()
+    test_stage11_cmd_vel_quiet_returns_true_on_timeout()
+    test_stage11_cmd_vel_quiet_returns_false_when_message_observed()
+    test_stage11_odom_stationary_true_for_zero_twist_samples()
+    test_stage11_odom_stationary_false_for_nonzero_second_sample()
+    test_stage11_inactive_readiness_reports_hand_gesture_direct_motor_blocking()
+    test_stage11_adapter_blocks_external_cmd_vel_by_default()
+    test_stage11_adapter_inactive_external_cmd_vel_opt_in_can_pass_without_direct_publishers()
+    test_stage11_adapter_blocks_hand_gesture_direct_motor_without_direct_override()
+    test_stage11_adapter_allows_hand_gesture_only_with_direct_override()
+    test_stage11_movement_blocked_after_inactive_arm_failure()
     test_stage8_graph_probe_module_import_is_inert()
     test_stage8_graph_probe_constructor_is_inert()
     test_stage8_fake_node_list_and_topics_work()

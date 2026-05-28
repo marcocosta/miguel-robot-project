@@ -38,6 +38,8 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
         readiness_probe: object | None = None,
         require_safe_graph_to_arm: bool = True,
         allow_competing_publishers_override: bool = False,
+        allow_inactive_external_cmd_vel_publishers: bool = False,
+        allow_external_direct_motor_publishers_override: bool = False,
     ) -> None:
         self.node = node
         self.publisher = publisher
@@ -48,6 +50,8 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
         self.readiness_probe = readiness_probe
         self.require_safe_graph_to_arm = require_safe_graph_to_arm
         self.allow_competing_publishers_override = allow_competing_publishers_override
+        self.allow_inactive_external_cmd_vel_publishers = allow_inactive_external_cmd_vel_publishers
+        self.allow_external_direct_motor_publishers_override = allow_external_direct_motor_publishers_override
         self.armed = False
         self.command_log: list[dict] = []
         self._latest_telemetry: dict | None = None
@@ -390,7 +394,17 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
                 from .miguel_hiwonder_ros2_graph_probe import MiguelHiWonderRos2GraphProbe
 
                 self.readiness_probe = MiguelHiWonderRos2GraphProbe(node=self.node)
-            report = self.readiness_probe.build_readiness_report()
+            if self.allow_inactive_external_cmd_vel_publishers:
+                if not hasattr(self.readiness_probe, "build_inactive_publisher_readiness_report"):
+                    return {
+                        "ok": False,
+                        "reason": "inactive_publisher_readiness_unavailable",
+                        "readiness_report": {},
+                        "warnings": [],
+                    }
+                report = self.readiness_probe.build_inactive_publisher_readiness_report()
+            else:
+                report = self.readiness_probe.build_readiness_report()
         except Exception as exc:
             return {
                 "ok": False,
@@ -457,8 +471,49 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
                 "readiness_report": report,
                 "warnings": warnings,
             }
+        inactive_mode = self.allow_inactive_external_cmd_vel_publishers
+        inactive_publishers_observed = report.get("inactive_publishers_observed") is True
+        cmd_vel_quiet = report.get("cmd_vel_quiet") or {}
+        odom_stationary = report.get("odom_stationary") or {}
+        direct_motor_blocking = bool(
+            report.get("direct_motor_blocking")
+            or external_direct_motor_publishers
+        )
+        relaxed_cmd_vel_allowed = (
+            inactive_mode
+            and competing_publishers
+            and inactive_publishers_observed
+            and cmd_vel_quiet.get("ok") is True
+            and cmd_vel_quiet.get("quiet") is True
+            and odom_stationary.get("ok") is True
+            and odom_stationary.get("stationary") is True
+            and low_level_motor_chain_ok is True
+        )
+
+        if inactive_mode and not (
+            inactive_publishers_observed
+            and cmd_vel_quiet.get("ok") is True
+            and cmd_vel_quiet.get("quiet") is True
+            and odom_stationary.get("ok") is True
+            and odom_stationary.get("stationary") is True
+        ):
+            return {
+                "ok": False,
+                "reason": "inactive_publisher_readiness_failed",
+                "readiness_report": report,
+                "warnings": warnings,
+            }
+        if inactive_mode and competing_publishers and not relaxed_cmd_vel_allowed:
+            return {
+                "ok": False,
+                "reason": "inactive_publisher_readiness_failed",
+                "readiness_report": report,
+                "warnings": warnings,
+            }
         if cmd_vel_safe_to_arm is False and not (
-            competing_publishers and self.allow_competing_publishers_override
+            competing_publishers and (
+                self.allow_competing_publishers_override or relaxed_cmd_vel_allowed
+            )
         ):
             return {
                 "ok": False,
@@ -466,17 +521,26 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
                 "readiness_report": report,
                 "warnings": warnings,
             }
-        if competing_publishers and not self.allow_competing_publishers_override:
+        if competing_publishers and not (
+            self.allow_competing_publishers_override or relaxed_cmd_vel_allowed
+        ):
             return {
                 "ok": False,
                 "reason": "ros2_graph_not_safe_to_arm",
                 "readiness_report": report,
                 "warnings": warnings,
             }
-        if competing_publishers:
+        if competing_publishers and self.allow_competing_publishers_override:
             warnings.append(
                 {
                     "reason": "competing_cmd_vel_publishers_override",
+                    "publishers": competing_publishers,
+                }
+            )
+        elif competing_publishers and relaxed_cmd_vel_allowed:
+            warnings.append(
+                {
+                    "reason": "inactive_external_cmd_vel_publishers_observed",
                     "publishers": competing_publishers,
                 }
             )
@@ -487,8 +551,9 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
                 "readiness_report": report,
                 "warnings": warnings,
             }
+        direct_motor_override_allowed = self.allow_external_direct_motor_publishers_override
         if direct_motor_safe_to_arm is False and not (
-            external_direct_motor_publishers and self.allow_competing_publishers_override
+            external_direct_motor_publishers and direct_motor_override_allowed
         ):
             return {
                 "ok": False,
@@ -496,7 +561,7 @@ class MiguelHiWonderRos2Adapter(MiguelHiWonderAdapterBase):
                 "readiness_report": report,
                 "warnings": warnings,
             }
-        if external_direct_motor_publishers and not self.allow_competing_publishers_override:
+        if direct_motor_blocking and not direct_motor_override_allowed:
             return {
                 "ok": False,
                 "reason": "direct_motor_graph_not_safe_to_arm",
