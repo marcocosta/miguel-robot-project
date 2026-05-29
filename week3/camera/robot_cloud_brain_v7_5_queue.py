@@ -506,6 +506,7 @@ TERSE_ALLOWED_ROUTES = {
     "identity",
     "local_ack",
     "owner_password_ack",
+    "repeat",
     "robot_control",
     "safety_refusal",
     "scene_prelude",
@@ -1278,6 +1279,24 @@ def _is_explicit_long_story_request(text: str) -> bool:
     return any(marker in normalized for marker in markers)
 
 
+def _long_story_depth_applies_to_route(route: str, last_user_text: str, conversation_mode: str) -> bool:
+    normalized = normalize_command_text(last_user_text)
+    if route in {"creative", "story"}:
+        return True
+    if conversation_mode in {"creative", "story"} and route == "normal" and _is_contextual_followup(normalized):
+        return True
+    return any(
+        marker in normalized
+        for marker in {
+            "continue chapter",
+            "next chapter",
+            "tell more story",
+            "continue the story",
+            "story part",
+        }
+    )
+
+
 def _ready_cue_min_interval_seconds() -> float:
     try:
         return max(0.0, float(os.getenv("MIGUEL_READY_CUE_MIN_INTERVAL_SECONDS", "2.0")))
@@ -1654,7 +1673,7 @@ def make_robot_reply_concise(
     depth = str(response_depth_mode or "normal").strip().lower()
     if mode not in {"terse", "normal", "detailed", "story", "long_story"}:
         mode = "normal"
-    if depth == "long_story" and context in {"creative", "story", "normal"}:
+    if depth == "long_story" and context in {"creative", "story"}:
         mode = "long_story"
     elif depth == "long_explanation" and context not in TERSE_ALLOWED_ROUTES:
         mode = "detailed"
@@ -2029,6 +2048,14 @@ def _is_preserved_command_transcript(text: str) -> bool:
         "what are you",
         "who am i",
         "who do you see",
+        "you see me",
+        "see me",
+        "see me now",
+        "you see me now",
+        "do you see me now",
+        "can you see me now",
+        "am i visible",
+        "can you recognize me now",
         "what do you see",
         "who are the engineers",
         "who is the engineer",
@@ -2131,6 +2158,14 @@ def _direct_command_kind(text: str) -> str | None:
         for phrase in {
             "who am i",
             "who do you see",
+            "you see me",
+            "see me",
+            "see me now",
+            "you see me now",
+            "do you see me now",
+            "can you see me now",
+            "am i visible",
+            "can you recognize me now",
             "do you recognize me",
             "identify me",
             "who is this person",
@@ -3541,6 +3576,29 @@ def _route_heard_repeat(user_text: str, state: RobotRuntimeState) -> bool:
     return True
 
 
+def _route_repeat_last_reply(user_text: str, state: RobotRuntimeState) -> bool:
+    normalized = normalize_command_text(user_text)
+    if not any(
+        phrase in normalized
+        for phrase in {
+            "repeat what you last said",
+            "repeat your last answer",
+            "repeat that",
+            "say that again",
+            "what did you just say",
+            "what did you say",
+        }
+    ):
+        return False
+    with state.lock:
+        last_spoken = str(state.last_spoken_text or "").strip()
+    print("[V7.15 REPEAT] served_local=true")
+    _set_reply_context(state, "repeat")
+    _set_transient_response_length_context(state, "normal")
+    v6.speak(last_spoken or "I do not have a previous reply to repeat.")
+    return True
+
+
 def _format_timer_duration(seconds: int) -> str:
     seconds = max(0, int(seconds))
     if seconds and seconds % 60 == 0:
@@ -3836,28 +3894,74 @@ def _is_voice_modes_list_request(user_text: str) -> bool:
     if not normalized:
         return False
     phrases = {
+        "all your voice modes",
+        "different types of voice",
+        "different voice types",
         "list your voice modes",
+        "what are your voice modes",
         "what are all your voice modes",
+        "what voice can we set you up",
         "what voice modes do you have",
         "what voices do you have",
-        "what are your voice modes",
         "voice modes",
         "voice options",
     }
-    return normalized in phrases or any(normalized.startswith(phrase + " ") for phrase in phrases)
+    return normalized in phrases or any(normalized.startswith(phrase + " ") or phrase in normalized for phrase in phrases)
+
+
+def _voice_mode_command_action(user_text: str) -> tuple[str, str | None]:
+    normalized = normalize_command_text(user_text)
+    if not normalized:
+        return "", None
+    if _is_voice_modes_list_request(normalized):
+        return "list", None
+    if any(phrase in normalized for phrase in {"natural voice", "use natural voice", "speak naturally"}):
+        return "set", "natural_voice"
+    if any(
+        phrase in normalized
+        for phrase in {
+            "do you have a deep voice",
+            "can you use a deep voice",
+            "deep voice",
+            "use deep voice",
+            "robot voice",
+            "use robot voice",
+            "storyteller voice",
+            "kid-friendly storyteller voice",
+            "friendly voice",
+        }
+    ):
+        return "unsupported", None
+    return "", None
 
 
 def _route_voice_modes_local_reply(user_text: str, state: RobotRuntimeState) -> bool:
-    if not _is_voice_modes_list_request(user_text):
+    action, requested_mode = _voice_mode_command_action(user_text)
+    if not action:
         return False
     current_voice = _current_voice_mode()
-    print("[V7.15 VOICE MODES] served_local=true")
     _set_reply_context(state, "voice_command")
-    _set_transient_response_length_context(state, "normal")
+    _set_transient_response_length_context(state, "terse" if action == "set" else "normal")
+    print(f"[V7.15 VOICE MODES] served_local=true action={action}")
+    if action == "set" and requested_mode == "natural_voice":
+        setter = getattr(robot_memory, "set_voice_mode", None)
+        if callable(setter):
+            try:
+                setter("natural_voice")
+            except Exception as exc:
+                print("[V7.15 VOICE MODES] set warning:", exc)
+        v6.speak("Natural voice.")
+        return True
+    if action == "unsupported":
+        v6.speak(
+            f"My current voice is {current_voice}. Extra TTS voices like deep, robot, or storyteller voice "
+            "are still experimental unless Marquinho enables them."
+        )
+        return True
     v6.speak(
-        f"My current voice is {current_voice}. I do not have multiple TTS voices yet, "
-        "but I do have response modes: normal, creative, long story, long explanation, sleep, owner mode, "
-        "and shutdown confirmation."
+        f"My current voice is {current_voice}. I can change response styles like normal, creative, "
+        "long story, and long explanation. Extra TTS voices like deep or robot voice are still experimental "
+        "unless Marquinho enables them."
     )
     return True
 
@@ -3867,6 +3971,7 @@ def _is_capabilities_request(user_text: str) -> bool:
     if not normalized:
         return False
     phrases = {
+        "all commands",
         "what can you do",
         "what are your capabilities",
         "what modes do you have",
@@ -3874,12 +3979,17 @@ def _is_capabilities_request(user_text: str) -> bool:
         "command list",
         "help",
         "what commands can i say",
+        "what commands do you know",
+        "provide a detailed list of your commands",
+        "detailed list of your commands",
+        "full command list",
+        "explain your commands",
         "explain all your capabilities",
         "detailed command list",
         "list all commands",
         "tell me all your modes",
     }
-    return normalized in phrases or any(normalized.startswith(phrase + " ") for phrase in phrases)
+    return normalized in phrases or any(normalized.startswith(phrase + " ") or phrase in normalized for phrase in phrases)
 
 
 def _route_capabilities_local_reply(user_text: str, state: RobotRuntimeState) -> bool:
@@ -3891,21 +4001,30 @@ def _route_capabilities_local_reply(user_text: str, state: RobotRuntimeState) ->
         phrase in normalized
         for phrase in {
             "explain all your capabilities",
+            "detailed list of your commands",
             "detailed command list",
+            "provide a detailed list of your commands",
             "list all commands",
+            "all commands",
+            "full command list",
+            "explain your commands",
+            "what commands do you know",
+            "what commands can i say",
             "tell me all your modes",
         }
     )
-    print("[V7.15 CAPABILITIES] served_local=true")
+    print(f"[V7.15 CAPABILITIES] served_local=true detail={str(detailed).lower()}")
     _set_reply_context(state, "capabilities")
     if detailed:
-        _set_transient_response_length_context(state, "detailed")
+        _set_transient_response_length_context(state, "normal")
         v6.speak(
-            "Here are my main modes. Say Hey Miguel to wake me and talk normally. "
-            "For camera, ask what do you see. For faces, ask who am I, can you see me, or who do you see, including both faces. "
-            "I can set timers, tell jokes, remember Marco and Marquinho's project roles, invent superheroes and machines in creative mode, "
-            "and use long story or long explanation mode for richer answers. I also have owner mode with a secret phrase, sleep mode, "
-            "and shutdown with confirmation. I refuse dangerous requests."
+            "Here are commands I can actually handle. Say Hey Miguel or Hello Miguel to start talking. "
+            "Ask can you hear me or can you hear us. Say set a timer for five minutes, cancel timer, or timer status. "
+            "Ask for a joke or science joke. Ask what do you see, can you see me, who am I, who do you see, or can you see both faces. "
+            "Say creative mode, then ask for superhero, machine, or sci-fi ideas. Say long story mode, continue chapter four, "
+            "long explanation mode, normal mode, or keep it short. Ask about Marco and Marquinho's project roles. "
+            "Owner mode needs the secret phrase, which I will not reveal. I also support sleep mode, wake mode, and shutdown with explicit confirmation. "
+            "I refuse dangerous requests."
         )
         return True
 
@@ -4049,6 +4168,12 @@ def _choose_first_direct_command(user_text: str) -> str:
             ("voice", "voice"),
             ("camera_identity", "who am i"),
             ("camera_identity", "who do you see"),
+            ("camera_identity", "you see me now"),
+            ("camera_identity", "you see me"),
+            ("camera_identity", "see me now"),
+            ("camera_identity", "see me"),
+            ("camera_identity", "am i visible"),
+            ("camera_identity", "can you recognize me now"),
             ("camera_identity", "do you recognize me"),
             ("camera_identity", "identify me"),
             ("camera_identity", "who is this person"),
@@ -4758,9 +4883,9 @@ def _is_shutdown_confirm_text(text: str) -> bool:
         "confirme shutdown",
         "firm shutdown",
         "yes shutdown",
-        "yes",
-        "yeah",
-        "yep",
+        "yes shut down",
+        "yes shutdown",
+        "yes, shut down",
     }
 
 
@@ -4960,12 +5085,19 @@ def _route_shutdown_control(user_text: str, state: RobotRuntimeState) -> bool | 
         pending = bool(state.shutdown_pending or state.shutdown_confirmation_pending)
         creative_mode = state.conversation_mode == "creative"
 
-    if pending and (_is_shutdown_confirm_text(user_text) or _is_shutdown_request_text(user_text)):
+    if pending and _is_shutdown_confirm_text(user_text):
         _set_shutdown_pending(state, False)
         _set_reply_context(state, "shutdown_confirm")
         v6.speak("Confirmed.")
         state.stop_event.set()
         return False
+
+    if pending and _is_shutdown_request_text(user_text):
+        print("[V7.14 SHUTDOWN] repeated_shutdown_requires_confirm=true")
+        set_interaction_state(state, "shutdown_pending", "Confirm shutdown")
+        _set_reply_context(state, "shutdown")
+        v6.speak("Please say confirm shutdown or cancel.")
+        return True
 
     if pending and _is_shutdown_cancel_text(user_text):
         _set_shutdown_pending(state, False)
@@ -5063,6 +5195,14 @@ def _expanded_identity_trigger(user_text: str) -> str:
     if multi_face:
         return multi_face
     triggers = {
+        "you see me": "short_see_me",
+        "see me": "short_see_me",
+        "see me now": "short_see_me",
+        "you see me now": "short_see_me",
+        "do you see me now": "short_see_me",
+        "can you see me now": "short_see_me",
+        "am i visible": "short_see_me",
+        "can you recognize me now": "short_see_me",
         "who is this person": "who_is_this_person",
         "who do you see": "who_do_you_see",
         "do you see me": "do_you_see_me",
@@ -6526,6 +6666,11 @@ def handle_queued_turn(
         _mark_route_done(state, turn_started_at)
         return True
 
+    _set_reply_context(state, "repeat")
+    if _route_repeat_last_reply(user_text, state):
+        _mark_route_done(state, turn_started_at)
+        return True
+
     _set_reply_context(state, "depth_mode")
     if _route_depth_status_local_reply(user_text, state):
         _mark_route_done(state, turn_started_at)
@@ -6788,12 +6933,16 @@ def speech_worker(
                 max_words = None
                 if (
                     response_depth_mode == "long_story"
-                    and route in {"creative", "story", "normal"}
+                    and _long_story_depth_applies_to_route(route, last_user_text, conversation_mode)
                     and response_length_mode != "terse"
                 ):
                     max_words = 250 if _is_explicit_long_story_request(last_user_text) else 180
                     max_words = max(120 if _is_explicit_long_story_request(last_user_text) else 80, max_words)
                     print(f"[V7.15 LENGTH] depth=long_story allowed_words={max_words}")
+                elif response_depth_mode == "long_story":
+                    print(f"[V7.15 LENGTH] depth=long_story ignored_for_route={route}")
+                    if response_length_mode == "long_story":
+                        response_length_mode = "normal"
                 elif (
                     response_depth_mode == "long_explanation"
                     and route not in TERSE_ALLOWED_ROUTES
