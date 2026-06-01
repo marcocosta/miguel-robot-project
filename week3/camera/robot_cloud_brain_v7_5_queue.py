@@ -1114,7 +1114,7 @@ def _update_face_identity_runtime_state(
             active = bool(state.conversation_active and time.time() <= float(state.conversation_until or 0.0))
             mode = state.conversation_mode
             should_preserve = active and mode in {"creative", "story", "project"}
-            should_update_partner = active and state.conversation_partner != recognized
+            should_update_partner = active and not state.conversation_partner
             if should_preserve or should_update_partner:
                 state.conversation_partner = recognized
                 state.last_conversation_activity_at = time.time()
@@ -2017,7 +2017,9 @@ def make_robot_reply_concise(
         return _trim_scene_reply(original, limit)
 
     if context == "identity":
-        return _limit_words(_first_sentence(original), 4)
+        if re.search(r"\bi see\s+\d+\s+faces\b|\bi see\s+one\s+face\b", lower):
+            return _limit_words(original, max(limit, 18))
+        return _limit_words(_first_sentence(original), 8)
 
     if mode == "terse":
         shaped = _limit_words(_first_sentence(original), limit)
@@ -6183,11 +6185,29 @@ def _face_count_from_state(face_state: dict) -> int:
 
 def _recognized_names_from_face_state(face_state: dict) -> list[str]:
     names: list[str] = []
+    explicit_names = face_state.get("recognized_names")
+    if isinstance(explicit_names, (list, tuple, set)):
+        for name in explicit_names:
+            normalized_name = _normalize_person_name(name)
+            if normalized_name and normalized_name not in names:
+                names.append(normalized_name)
     person = _normalize_person_name(face_state.get("recognized_person"))
-    if person:
+    if person and person not in names:
         names.append(person)
     if _face_count_from_state(face_state) < 2:
         return names[:1]
+    votes = face_state.get("recognition_votes")
+    if isinstance(votes, dict):
+        for name, vote_count in sorted(votes.items(), key=lambda item: item[1], reverse=True):
+            normalized_name = _normalize_person_name(name)
+            if not normalized_name or normalized_name in names:
+                continue
+            try:
+                if int(vote_count or 0) <= 0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            names.append(normalized_name)
     scores = face_state.get("recognition_scores")
     if isinstance(scores, dict):
         for name, score in scores.items():
@@ -6201,6 +6221,28 @@ def _recognized_names_from_face_state(face_state: dict) -> list[str]:
             if score_value >= 0.55:
                 names.append(normalized_name)
     return names[:2]
+
+
+def _recent_recognized_names_from_tracker(tracker: IdentityTracker | None, max_age_seconds: float = 5.0) -> list[str]:
+    if tracker is None:
+        return []
+    observations = tracker._recent_observations(max_age_seconds)
+    by_person: dict[str, list[dict]] = {}
+    for obs in observations:
+        person = _normalize_person_name(obs.get("recognized_person"))
+        if person:
+            by_person.setdefault(person, []).append(obs)
+
+    ranked: list[tuple[int, float, float, str]] = []
+    for person, person_observations in by_person.items():
+        votes = len(person_observations)
+        avg_score = sum(float(obs.get("recognition_score") or 0.0) for obs in person_observations) / votes
+        avg_margin = sum(float(obs.get("recognition_margin") or 0.0) for obs in person_observations) / votes
+        if _identity_candidate_accepted(person, votes, avg_score, avg_margin):
+            ranked.append((votes, avg_score, avg_margin, person))
+
+    ranked.sort(reverse=True)
+    return [person for _votes, _score, _margin, person in ranked[:2]]
 
 
 def _fresh_multi_face_state_for_route(camera_manager, state: RobotRuntimeState, timeout_seconds: float = 1.4) -> dict:
@@ -6226,19 +6268,29 @@ def _fresh_multi_face_state_for_route(camera_manager, state: RobotRuntimeState, 
             if tracked_state and (best_state is None or rank(tracked_state) > rank(best_state)):
                 best_state = tracked_state
 
-        if best_state and _face_count_from_state(best_state) >= 2 and _recognized_names_from_face_state(best_state):
+        if best_state and _face_count_from_state(best_state) >= 2 and len(_recognized_names_from_face_state(best_state)) >= 2:
             break
         if time.time() >= deadline:
             break
         time.sleep(0.15)
 
     selected = best_state or _stable_identity_reply_state(face_detected=False)
+    if _face_count_from_state(selected) >= 2:
+        merged_names = _recognized_names_from_face_state(selected)
+        for name in _recent_recognized_names_from_tracker(tracker, max_age_seconds=5.0):
+            if name not in merged_names:
+                merged_names.append(name)
+        if merged_names:
+            selected = dict(selected)
+            selected["recognized_names"] = merged_names[:2]
     recognized = ",".join(_recognized_names_from_face_state(selected)) or "none"
     print(f"[V7.14 IDENTITY] fresh_faces_result=count={_face_count_from_state(selected)} recognized={recognized}")
     return selected
 
 
 def _format_name_list(names: list[str]) -> str:
+    order = {"marco": 0, "marquinho": 1}
+    names = sorted(names, key=lambda name: (order.get(_normalize_person_name(name), 99), _normalize_person_name(name)))
     pretty = [name.replace("_", " ").title() for name in names if name]
     if not pretty:
         return ""
