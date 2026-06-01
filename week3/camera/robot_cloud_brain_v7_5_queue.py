@@ -1318,7 +1318,9 @@ def _long_story_depth_applies_to_route(route: str, last_user_text: str, conversa
     normalized = normalize_command_text(last_user_text)
     if route in {"creative", "story"}:
         return True
-    if conversation_mode in {"creative", "story"} and route == "normal" and _is_contextual_followup(normalized):
+    if conversation_mode in {"creative", "story"} and route == "normal" and (
+        _is_contextual_followup(normalized) or _is_story_continue_text(normalized)
+    ):
         return True
     return any(
         marker in normalized
@@ -1328,6 +1330,8 @@ def _long_story_depth_applies_to_route(route: str, last_user_text: str, conversa
             "tell more story",
             "continue the story",
             "story part",
+            "keep going",
+            "keep it going",
         }
     )
 
@@ -2591,7 +2595,19 @@ def _infer_conversation_mode(text: str, camera_intent: str = "none") -> str:
         return "creative"
     if any(
         phrase in normalized
-        for phrase in {"story mode", "tell me a story", "continue the story", "narrate"}
+        for phrase in {
+            "story mode",
+            "tell me a story",
+            "tell a story",
+            "make a story",
+            "create a story",
+            "invent a story",
+            "new story",
+            "another story",
+            "change the story",
+            "continue the story",
+            "narrate",
+        }
     ):
         return "story"
     if any(
@@ -2769,9 +2785,87 @@ def _extract_called_or_named_subject(text: str) -> str | None:
     return name or None
 
 
+STORY_CONTINUATION_PHRASES = {
+    "continue",
+    "continue story",
+    "continue the story",
+    "keep going",
+    "keep it going",
+    "keep it going miguel",
+    "go on",
+    "next part",
+    "next chapter",
+    "what happens next",
+}
+
+
+def _is_story_continue_text(text: str) -> bool:
+    normalized = normalize_command_text(text)
+    if not normalized:
+        return False
+    return normalized in STORY_CONTINUATION_PHRASES or any(
+        normalized.startswith(phrase + " ") or phrase in normalized
+        for phrase in {
+            "continue the story",
+            "keep going",
+            "keep it going",
+            "next part",
+            "next chapter",
+            "what happens next",
+        }
+    )
+
+
+def _is_new_story_request(text: str) -> bool:
+    normalized = normalize_command_text(text)
+    if not normalized or "story" not in normalized:
+        return False
+    return any(
+        marker in normalized
+        for marker in {
+            "new story",
+            "another story",
+            "different story",
+            "change the story",
+            "change story",
+            "start a new story",
+            "make a story",
+            "create a story",
+            "invent a story",
+            "tell me a story",
+            "tell a story",
+        }
+    )
+
+
+def _extract_story_theme(text: str) -> str:
+    normalized = normalize_command_text(text)
+    if not normalized:
+        return "new adventure"
+    patterns = [
+        r"\bstory\s+(?:about|around|with)\s+(.+)$",
+        r"\b(?:make|create|invent|tell me|tell)\s+(?:a\s+)?(?:new\s+)?story\s+(?:about|around|with)\s+(.+)$",
+        r"\bchange\s+(?:the\s+)?story\s+(?:to|for|into|about)\s+(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            theme = match.group(1).strip(" .,:;!?")
+            theme = re.sub(r"\b(?:please|yeah|miguel|and make it exciting|make it exciting|be exciting)\b", " ", theme).strip()
+            return re.sub(r"\s+", " ", theme) or "new adventure"
+    if _is_new_story_request(normalized):
+        return "new adventure"
+    return normalized or "new adventure"
+
+
 def _extract_creative_topic(text: str) -> dict | None:
     normalized = normalize_command_text(text)
     if not normalized or not any(keyword in normalized for keyword in CREATIVE_TOPIC_KEYWORDS):
+        return None
+    if not _is_new_story_request(normalized) and (
+        normalized in LONG_STORY_ACTIVATION_PHRASES
+        or normalized in {"story mode", "long story mode", "go to long story mode"}
+    ):
         return None
     if _contains_real_world_harm_instruction(normalized):
         return None
@@ -2785,6 +2879,8 @@ def _extract_creative_topic(text: str) -> dict | None:
     category = "creative"
     if "story" in normalized:
         category = "story"
+        if not subject:
+            subject = _extract_story_theme(text)
     elif any(word in normalized for word in {"machine", "invention", "invent", "technology", "tech", "sci fi", "sci-fi", "robot"}):
         category = "invention"
     elif any(word in normalized for word in {"superhero", "hero", "character", "skeleton", "power", "powers", "turtle spirit"}):
@@ -2875,6 +2971,27 @@ def _update_active_topic_from_text(state: RobotRuntimeState, text: str) -> dict 
     return topic
 
 
+def _start_new_story_topic(state: RobotRuntimeState, text: str, partner: str | None = None) -> str:
+    theme = _extract_story_theme(text)
+    topic = {"label": f"story: {theme}", "name": theme, "category": "story"}
+    now = time.time()
+    with state.lock:
+        state.active_topic = dict(topic)
+        state.active_topic_updated_at = now
+        state.session_focus = ""
+        state.session_topic = "story"
+        state.last_user_creative_subject = theme
+        state.last_topic = str(topic["label"])
+        state.last_topic_until = now + 600.0
+        state.long_story_topic = str(topic["label"])
+        state.long_story_segment_index = 0
+        state.long_story_max_segments = 0
+        state.conversation_mode = "story"
+    start_conversation_session(state, mode="story", partner=partner or _current_owner_partner(state), reason="new_story")
+    print(f"[V7.15 STORY] new_topic={_topic_log_label(topic)}")
+    return theme
+
+
 def _store_interrupted_creative_topic(state: RobotRuntimeState, text: str) -> None:
     topic = _extract_creative_topic(text)
     if not topic:
@@ -2888,6 +3005,8 @@ def _is_contextual_followup(text: str) -> bool:
     normalized = normalize_command_text(text)
     if not normalized:
         return False
+    if _is_story_continue_text(normalized):
+        return True
     if normalized in CONTEXTUAL_FOLLOWUP_PHRASES:
         return True
     if any(phrase in normalized for phrase in CONTEXTUAL_FOLLOWUP_PHRASES):
@@ -2932,6 +3051,9 @@ def _recover_contextual_followup_prompt(text: str, state: RobotRuntimeState) -> 
 
     label = _topic_log_label(topic)
     print(f"[V7.14 MEMORY] recovered_context topic={label}")
+    category = str(topic.get("category") or "").strip().lower()
+    if category == "story" or _is_story_continue_text(text):
+        return f"Continue the current story: {label}. User asks: {text}"
     return f"Continue the current creative topic: {label}. User asks: {text}"
 
 
@@ -4283,6 +4405,8 @@ def _route_correction_retry(user_text: str, state: RobotRuntimeState) -> bool:
 
 def _route_topic_followup_local_reply(user_text: str, state: RobotRuntimeState) -> bool:
     normalized = normalize_command_text(user_text)
+    if _is_story_continue_text(normalized):
+        return False
     if not _is_topic_continuation(user_text, state):
         if "star wars" in normalized:
             with state.lock:
@@ -4307,6 +4431,9 @@ def _route_response_depth_mode(user_text: str, state: RobotRuntimeState) -> bool
     if _is_depth_status_question(user_text):
         return False
 
+    if _is_new_story_request(user_text) and normalized not in LONG_STORY_ACTIVATION_PHRASES:
+        return False
+
     if _is_mode_command_not_physical(normalized):
         if any(marker in normalized for marker in {"long story mode"}):
             _set_response_depth_mode(state, "long_story", "mode_command")
@@ -4316,6 +4443,8 @@ def _route_response_depth_mode(user_text: str, state: RobotRuntimeState) -> bool
                 state.long_story_topic = None
                 state.long_story_segment_index = 0
             _force_active_after_mode(state, "story", reason="long_story_mode")
+            if _is_story_continue_text(normalized):
+                return False
             v6.speak("Long story mode on. I'll give richer stories when you ask.")
             return True
         if any(marker in normalized for marker in {"long explanation mode"}):
@@ -7584,6 +7713,10 @@ def handle_queued_turn(
                 _mark_route_done(state, turn_started_at)
                 return sleep_result
             mode = _infer_conversation_mode(stripped)
+            if mode == "general" and _is_story_continue_text(stripped):
+                with state.lock:
+                    if state.conversation_mode in {"story", "creative"} or (state.last_topic and "story" in state.last_topic.lower()):
+                        mode = state.conversation_mode if state.conversation_mode in {"story", "creative"} else "story"
             timeout = None if mode != "robot_control" else _env_float("MIGUEL_CONVERSATION_TIMEOUT_SECONDS", 120.0)
             start_conversation_session(state, mode=mode, partner=partner, timeout_seconds=timeout, reason="wake_plus_command")
             user_text = stripped
@@ -7647,8 +7780,18 @@ def handle_queued_turn(
         force_interaction_state(state, _ready_face_state(), _ready_face_text(state))
         return True
 
+    new_story_requested = _is_new_story_request(user_text)
+    if new_story_requested:
+        _start_new_story_topic(state, user_text, partner=partner)
+        with state.lock:
+            if state.response_depth_mode == "normal":
+                state.response_depth_mode = "long_story"
+            state.current_turn_latency["response_depth_mode"] = state.response_depth_mode
+        _set_response_length_context(state, "long_story")
+
     _remember_accepted_turn(state, user_text)
-    _update_active_topic_from_text(state, user_text)
+    if not new_story_requested:
+        _update_active_topic_from_text(state, user_text)
     _log_user_turn_event(state, user_text, route_hint="accepted", partner=partner)
 
     mode = _infer_conversation_mode(user_text)
@@ -7705,6 +7848,10 @@ def handle_queued_turn(
         and (current_conversation_mode in {"creative", "story"} or inferred_conversation_mode in {"creative", "story"})
     ):
         inferred_response_mode = "long_story"
+    elif new_story_requested:
+        inferred_conversation_mode = "story"
+        inferred_response_mode = "long_story"
+        response_depth_mode = "long_story"
     elif response_depth_mode == "long_explanation" and camera_intent == "none":
         inferred_response_mode = "detailed"
     if inferred_response_mode == "terse" and not _route_allows_terse_response(user_text, current_conversation_mode, camera_intent):
@@ -7863,6 +8010,13 @@ def handle_queued_turn(
         return True
 
     cloud_prompt_text = _recover_contextual_followup_prompt(user_text, state)
+    if new_story_requested:
+        story_theme = _extract_story_theme(user_text)
+        cloud_prompt_text = (
+            f"Start a new complete story with this theme: {story_theme}. "
+            "If the theme is vague, invent the full premise, characters, problem, obstacle, and ending. "
+            f"User request: {user_text}"
+        )
     recovered_context = cloud_prompt_text != user_text
     hard_stop_reason, hard_stop_reply = _local_safety_hard_stop(cloud_prompt_text)
     if hard_stop_reply:
