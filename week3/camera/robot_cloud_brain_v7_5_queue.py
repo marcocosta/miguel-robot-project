@@ -14,7 +14,9 @@ Architecture:
 import queue
 import os
 import difflib
+import json
 import re
+import shutil
 import sys
 import threading
 import time
@@ -151,14 +153,14 @@ class IdentityTracker:
         if not observations:
             return None
 
-        name, _votes, avg_score, avg_margin, obs = self._stable_candidate(
+        name, votes, avg_score, avg_margin, obs = self._stable_candidate(
             observations,
             allowed_names=None,
-            min_votes=2,
-            min_avg_score=0.65,
-            min_avg_margin=0.08,
+            min_votes=1,
+            min_avg_score=0.0,
+            min_avg_margin=0.0,
         )
-        if name and obs:
+        if name and obs and _identity_candidate_accepted(name, votes, avg_score, avg_margin):
             return self._state_from_observation(obs, recognized_person=name, score=avg_score, margin=avg_margin)
 
         return self._best_face_detected_state(observations)
@@ -169,15 +171,16 @@ class IdentityTracker:
             print("[V7.5 IDENTITY] owner authorization=None avg_score=0.00")
             return None
 
-        name, _votes, avg_score, avg_margin, obs = self._stable_candidate(
+        name, votes, avg_score, avg_margin, obs = self._stable_candidate(
             observations,
             allowed_names={"marco", "marquinho"},
-            min_votes=2,
-            min_avg_score=0.70,
-            min_avg_margin=0.10,
+            min_votes=1,
+            min_avg_score=0.0,
+            min_avg_margin=0.0,
         )
-        print(f"[V7.5 IDENTITY] owner authorization={name} avg_score={avg_score:.2f}")
-        if name and obs:
+        accepted_name = name if _identity_candidate_accepted(name, votes, avg_score, avg_margin, owner_context=True) else None
+        print(f"[V7.5 IDENTITY] owner authorization={accepted_name} avg_score={avg_score:.2f}")
+        if accepted_name and obs:
             return self._state_from_observation(obs, recognized_person=name, score=avg_score, margin=avg_margin)
 
         return None
@@ -287,6 +290,7 @@ class RobotRuntimeState:
         else "normal"
     )
     response_depth_mode: str = "normal"
+    allowed_conversation_languages: list[str] = field(default_factory=lambda: _default_allowed_conversation_languages())
     long_story_active: bool = False
     long_story_topic: str | None = None
     long_story_segment_index: int = 0
@@ -322,6 +326,7 @@ class RobotRuntimeState:
         else "visual"
     )
     suppress_next_ready_cue: bool = False
+    conversation_log_session_id: str | None = None
 
 
 @dataclass
@@ -411,7 +416,7 @@ def _response_word_limit(mode: str) -> int:
         return max(30, _env_int("MIGUEL_STORY_MAX_WORDS", 160))
     if mode == "long_story":
         return max(120, _env_int("MIGUEL_LONG_STORY_MAX_WORDS", 250))
-    return max(10, _env_int("MIGUEL_NORMAL_MAX_WORDS", 55))
+    return max(10, _env_int("MIGUEL_NORMAL_MAX_WORDS", 32))
 
 
 def _long_story_segment_words() -> int:
@@ -425,7 +430,9 @@ def _long_story_max_segments() -> int:
 def _conversation_timeout_seconds(mode: str = "general") -> float:
     if mode == "owner_password":
         return _env_float("MIGUEL_PASSWORD_SESSION_TIMEOUT_SECONDS", 600.0)
-    return _env_float("MIGUEL_CONVERSATION_TIMEOUT_SECONDS", 120.0)
+    if mode in {"creative", "story", "project"}:
+        return _env_float("MIGUEL_CREATIVE_CONVERSATION_TIMEOUT_SECONDS", 45.0)
+    return _env_float("MIGUEL_CONVERSATION_TIMEOUT_SECONDS", 60.0)
 
 
 def _owner_session_timeout_seconds() -> float:
@@ -501,10 +508,12 @@ def _current_face_priority_locked(state: RobotRuntimeState) -> tuple[int, str]:
 
 TERSE_ALLOWED_ROUTES = {
     "barge_in",
+    "clarification",
     "enrollment",
     "greeting",
     "identity",
     "local_ack",
+    "language_policy",
     "owner_password_ack",
     "repeat",
     "robot_control",
@@ -1055,12 +1064,29 @@ def set_interaction_state(state: RobotRuntimeState, new_state: str, status_text:
         notify_face_status(state, new_state, status_text)
 
 
+def force_interaction_state(state: RobotRuntimeState, new_state: str, status_text: str = "") -> None:
+    now = time.time()
+    with state.lock:
+        old_state = state.interaction_state
+        state.interaction_state = new_state
+        state.current_status_text = status_text
+        state.last_state_change_at = now
+        state.last_state_emit_at = now
+        state.last_state_emit_state = new_state
+        state.last_state_emit_text = status_text
+        state.last_state_emit_recognition_key = state.last_face_recognition_key
+        state.last_state_emit_key = (new_state, _interaction_status_key(new_state, status_text))
+    print(f"[V7.5 STATE] {old_state} -> {new_state} {status_text}".strip())
+    notify_face_status(state, new_state, status_text)
+
+
 def _update_face_identity_runtime_state(
     state: RobotRuntimeState,
     face_detected: bool,
     recognized_person: str | None,
     face_count: int | None = None,
     recognition_score: float | None = None,
+    recognition_margin: float | None = None,
 ) -> tuple[str, str]:
     recognized = _normalize_person_name(recognized_person)
     new_key = _face_recognition_key(face_detected, recognized)
@@ -1076,22 +1102,31 @@ def _update_face_identity_runtime_state(
         state.recognized_person = recognized
         state.recognized_person_updated_at = time.time()
         state.last_face_recognition_key = new_key
-    try:
-        score_ok = recognition_score is None or float(recognition_score) >= 0.55
-    except (TypeError, ValueError):
-        score_ok = True
+    score_ok = _identity_candidate_accepted(
+        recognized,
+        2,
+        recognition_score if recognition_score is not None else 1.0,
+        recognition_margin if recognition_margin is not None else 1.0,
+    )
     if face_detected and recognized and _is_owner(recognized) and score_ok:
         _refresh_owner_session(state, recognized)
         with state.lock:
             active = bool(state.conversation_active and time.time() <= float(state.conversation_until or 0.0))
             mode = state.conversation_mode
             should_preserve = active and mode in {"creative", "story", "project"}
-            if should_preserve:
+            should_update_partner = active and state.conversation_partner != recognized
+            if should_preserve or should_update_partner:
                 state.conversation_partner = recognized
                 state.last_conversation_activity_at = time.time()
-                state.conversation_until = max(float(state.conversation_until or 0.0), time.time() + 120.0)
+                if should_preserve:
+                    state.conversation_until = max(
+                        float(state.conversation_until or 0.0),
+                        time.time() + _conversation_timeout_seconds(mode),
+                    )
         if should_preserve:
             print(f"[V7.15 SESSION] familiar_face_preserved_mode mode={mode} partner={recognized}")
+        elif should_update_partner:
+            print(f"[V7.15 SESSION] partner_updated_from_face partner={recognized}")
     return previous_key, new_key
 
 
@@ -1536,6 +1571,259 @@ def normalize_command_text(text: str) -> str:
     return normalized
 
 
+LANGUAGE_ALIASES = {
+    "english": "english",
+    "ingles": "english",
+    "inglês": "english",
+    "portuguese": "portuguese",
+    "portugues": "portuguese",
+    "português": "portuguese",
+    "brazilian": "portuguese",
+    "brazilian portuguese": "portuguese",
+    "spanish": "spanish",
+    "espanol": "spanish",
+    "español": "spanish",
+    "italian": "italian",
+    "italiano": "italian",
+    "french": "french",
+    "frances": "french",
+    "francês": "french",
+    "romanian": "romanian",
+    "română": "romanian",
+    "czech": "czech",
+    "cesky": "czech",
+    "česky": "czech",
+}
+
+LANGUAGE_SCORE_WORDS = {
+    "english": {
+        "the", "and", "you", "your", "what", "who", "where", "when", "why", "how",
+        "please", "story", "universe", "english", "conversation", "only", "consider",
+        "ignore", "wake", "sleep", "shutdown", "status", "time", "weather", "calculate",
+    },
+    "portuguese": {
+        "que", "voce", "você", "para", "pra", "porque", "como", "quando", "agora",
+        "aqui", "isso", "esta", "está", "fazer", "fala", "filho", "papai", "brasil",
+        "portugues", "português", "nao", "não", "sim", "tambem", "também",
+        "isto", "chega", "pouco", "mais", "perto", "vai", "voce", "você", "quer",
+        "gente", "estou", "estava", "tá", "esta", "está", "chuva", "chovendo",
+    },
+    "spanish": {
+        "que", "como", "cuando", "donde", "porque", "hola", "gracias", "ahora",
+        "usted", "espanol", "español", "tambien", "también", "asi", "así",
+    },
+    "italian": {
+        "che", "come", "quando", "dove", "perche", "perché", "ciao", "grazie",
+        "italiano", "sono", "vecchio", "pero", "però",
+    },
+    "french": {
+        "que", "comment", "quand", "pourquoi", "bonjour", "merci", "francais",
+        "français", "avec", "vous",
+    },
+    "romanian": {
+        "cum", "cand", "când", "unde", "pentru", "romana", "română", "fariți",
+        "cumpărat",
+    },
+    "czech": {
+        "jak", "kdy", "kde", "proc", "proč", "cesky", "česky", "prakticka",
+        "praktická", "otazka", "otázka",
+    },
+}
+
+LANGUAGE_DIACRITIC_HINTS = {
+    "portuguese": set("ãõçáéíóúâêôà"),
+    "spanish": set("ñ¿¡"),
+    "italian": set("ìòèù"),
+    "french": set("ùûîïëÿœæ"),
+    "romanian": set("ăâîșşțţ"),
+    "czech": set("čďěňřšťůžýáíé"),
+}
+
+
+def _canonical_language_name(name: str) -> str | None:
+    raw = str(name or "").strip().lower()
+    normalized = _normalize_for_echo(raw)
+    return LANGUAGE_ALIASES.get(raw) or LANGUAGE_ALIASES.get(normalized)
+
+
+def _default_allowed_conversation_languages() -> list[str]:
+    configured = os.getenv("MIGUEL_ALLOWED_CONVERSATION_LANGUAGES", "english")
+    languages = []
+    for part in re.split(r"[,;/]|\band\b|\bor\b|\+", configured, flags=re.IGNORECASE):
+        language = _canonical_language_name(part)
+        if language and language not in languages:
+            languages.append(language)
+    return languages or ["english"]
+
+
+def _format_language_list(languages: list[str] | set[str] | tuple[str, ...]) -> str:
+    names = [str(language).strip().title() for language in languages if str(language).strip()]
+    if not names:
+        return "none"
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _extract_language_names_from_text(text: str) -> list[str]:
+    lowered = str(text or "").lower()
+    normalized = _normalize_for_echo(text)
+    found = []
+    for alias, canonical in sorted(LANGUAGE_ALIASES.items(), key=lambda item: len(item[0]), reverse=True):
+        alias_normalized = _normalize_for_echo(alias)
+        if (
+            re.search(rf"(?<![a-z]){re.escape(alias)}(?![a-z])", lowered)
+            or (alias_normalized and re.search(rf"(?<![a-z]){re.escape(alias_normalized)}(?![a-z])", normalized))
+        ):
+            if canonical not in found:
+                found.append(canonical)
+    return found
+
+
+def _language_policy_command(text: str) -> tuple[str, list[str]] | None:
+    normalized = normalize_command_text(text)
+    if not normalized:
+        return None
+    languages = _extract_language_names_from_text(text)
+    language_markers = {
+        "language", "languages", "english mode", "conversation", "consider",
+        "listen", "ignore", "respond", "reply", "speak",
+    }
+    has_marker = any(marker in normalized for marker in language_markers)
+    if not languages and ("allowed languages" in normalized or "language status" in normalized):
+        return "status", []
+    if not languages or not has_marker:
+        return None
+
+    set_markers = {
+        "only", "lock", "lock in", "lock only", "from now on", "stick to",
+        "use only", "answer only", "reply only", "consider only", "only consider",
+    }
+    remove_markers = {"ignore", "dont consider", "don t consider", "do not consider", "don't consider", "stop considering"}
+    add_markers = {"also", "add", "include", "allow", "accept"}
+
+    if any(marker in normalized for marker in remove_markers) and any(marker in normalized for marker in set_markers):
+        removed = []
+        for language in languages:
+            for alias, canonical in LANGUAGE_ALIASES.items():
+                if canonical != language:
+                    continue
+                alias_normalized = _normalize_for_echo(alias)
+                if any(
+                    f"{marker} {alias_normalized}" in normalized
+                    or f"{marker} the {alias_normalized}" in normalized
+                    for marker in remove_markers
+                ):
+                    removed.append(language)
+                    break
+        kept = [language for language in languages if language not in set(removed)]
+        if kept:
+            return "set", kept
+
+    if any(marker in normalized for marker in set_markers):
+        return "set", languages
+    if any(marker in normalized for marker in remove_markers):
+        keep_languages = []
+        if "only" in normalized and len(languages) >= 1:
+            keep_languages = [languages[0]]
+        return ("set", keep_languages) if keep_languages else ("remove", languages)
+    if any(marker in normalized for marker in add_markers):
+        return "add", languages
+    if "language" in normalized or "conversation" in normalized:
+        return "set", languages
+    return None
+
+
+def _route_language_policy_local_reply(user_text: str, state: RobotRuntimeState) -> bool:
+    command = _language_policy_command(user_text)
+    if not command:
+        return False
+    action, languages = command
+    with state.lock:
+        current = list(state.allowed_conversation_languages or ["english"])
+        if action == "status":
+            result = current
+        elif action == "set":
+            result = languages or ["english"]
+            state.allowed_conversation_languages = result
+        elif action == "add":
+            result = current
+            for language in languages:
+                if language not in result:
+                    result.append(language)
+            state.allowed_conversation_languages = result
+        elif action == "remove":
+            result = [language for language in current if language not in set(languages)]
+            if not result:
+                result = ["english"]
+            state.allowed_conversation_languages = result
+        else:
+            result = current
+    print(f"[V7.15 LANGUAGE] allowed={','.join(result)} action={action}")
+    _force_active_after_mode(state, "general", reason="language_policy")
+    v6.speak(f"Language filter set to {_format_language_list(result)}.")
+    return True
+
+
+def _language_scores(text: str) -> dict[str, int]:
+    lowered = str(text or "").lower()
+    normalized = _normalize_for_echo(text)
+    words = set(normalized.split())
+    scores = {}
+    for language, markers in LANGUAGE_SCORE_WORDS.items():
+        score = len(words & {_normalize_for_echo(marker) for marker in markers})
+        hints = LANGUAGE_DIACRITIC_HINTS.get(language, set())
+        if any(char in lowered for char in hints):
+            score += 3
+        if score:
+            scores[language] = score
+    return scores
+
+
+def _detect_transcript_language(text: str) -> tuple[str | None, dict[str, int]]:
+    scores = _language_scores(text)
+    if not scores:
+        return None, {}
+    ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+    return ranked[0][0], dict(ranked)
+
+
+def _language_policy_bypass(text: str) -> bool:
+    normalized = normalize_command_text(text)
+    return bool(
+        _language_policy_command(text)
+        or _is_sleep_mode_request(normalized)
+        or _is_sleep_wake_request(normalized)
+        or _is_shutdown_request_text(normalized)
+        or _is_shutdown_confirm_text(normalized)
+        or _is_shutdown_cancel_text(normalized)
+        or is_barge_in_command(normalized)
+        or _is_global_without_wake_command(normalized)
+    )
+
+
+def _language_policy_allows_turn(user_text: str, state: RobotRuntimeState) -> bool:
+    if _language_policy_bypass(user_text):
+        return True
+    with state.lock:
+        allowed = set(state.allowed_conversation_languages or ["english"])
+    detected, scores = _detect_transcript_language(user_text)
+    if not detected:
+        return True
+    if detected in allowed:
+        return True
+    allowed_score = max([scores.get(language, 0) for language in allowed] or [0])
+    detected_score = scores.get(detected, 0)
+    if allowed_score and allowed_score >= detected_score:
+        return True
+    print(
+        "[V7.15 LANGUAGE] ignored "
+        f"detected={detected} allowed={','.join(sorted(allowed))} "
+        f"text={_short_log_text(user_text)}"
+    )
+    return False
+
+
 def _is_bare_wake_phrase(text: str) -> bool:
     return _normalize_for_echo(text) in {
         "miguel",
@@ -1629,10 +1917,11 @@ def _friendly_person_name(name: str | None) -> str:
 
 
 def _trim_scene_reply(text: str, max_words: int = 14) -> str:
+    original = str(text or "").strip()
     cleaned = re.sub(
         r"^(the image shows|image shows|the frame shows|frame shows|in the image,?|this image shows)\s+",
         "I see ",
-        str(text or "").strip(),
+        original,
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(r"^i see\s+(that\s+)?(the\s+)?image\s+shows\s+", "I see ", cleaned, flags=re.IGNORECASE)
@@ -1651,6 +1940,20 @@ def _trim_scene_reply(text: str, max_words: int = 14) -> str:
     kept = [clause.strip() for clause in clauses if clause.strip() and not any(b in clause.lower() for b in banned)]
     if kept:
         cleaned = ", ".join(kept)
+
+    if _word_len(cleaned) < 6 and _word_len(_first_sentence(original)) >= 6:
+        cleaned = _first_sentence(original)
+        cleaned = re.sub(
+            r"^(the image shows|image shows|the frame shows|frame shows|in the image,?|this image shows)\s+",
+            "I see ",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if cleaned and not cleaned.lower().startswith("i see"):
+            cleaned = "I see " + cleaned[0].lower() + cleaned[1:]
+
+    if _word_len(cleaned) < 4:
+        cleaned = "I can only see part of the camera view."
 
     if not cleaned.endswith((".", "!", "?")):
         cleaned += "."
@@ -2038,6 +2341,13 @@ def _contains_grace_command_phrase(text: str) -> bool:
         "new friend",
         "time",
         "status",
+        "recent topics",
+        "previous topics",
+        "conversation history",
+        "analyze conversation",
+        "analyze previous log",
+        "previous log",
+        "log file",
     ]
     return any(p in t for p in phrases)
 
@@ -2153,6 +2463,14 @@ def _direct_command_kind(text: str) -> str | None:
         return "timer"
     if _is_voice_command_text(normalized):
         return "voice"
+    if (
+        _is_recent_conversation_topics_request(normalized)
+        or _is_conversation_log_analysis_request(normalized)
+        or _is_conversation_log_location_request(normalized)
+    ):
+        return "memory"
+    if _is_capabilities_request(normalized):
+        return "capabilities"
     if is_identity_camera_request(normalized) or any(
         phrase in normalized
         for phrase in {
@@ -2169,6 +2487,14 @@ def _direct_command_kind(text: str) -> str | None:
             "do you recognize me",
             "identify me",
             "who is this person",
+            "who is this face",
+            "who is that face",
+            "who is his face",
+            "who is her face",
+            "who is this child",
+            "who is that child",
+            "identify this face",
+            "whose face is this",
             "do you see me",
             "do you see a face",
             "can you see a face",
@@ -2193,6 +2519,11 @@ def _direct_command_kind(text: str) -> str | None:
             "is marco there",
             "can you see marco",
             "can you see marquinho",
+            "see any other face",
+            "any other face besides me",
+            "other face besides me",
+            "anyone behind me",
+            "anybody behind me",
         }
     ):
         return "camera_identity"
@@ -2203,7 +2534,7 @@ def _direct_command_kind(text: str) -> str | None:
         return "camera_scene"
     if any(phrase in normalized for phrase in {"what time is it", "current time", "status"}):
         return "time_status"
-    if any(phrase in normalized for phrase in {"weather", "calculate", "who am i", "can you see me"}):
+    if any(phrase in normalized for phrase in {"weather", "calculate"}):
         return "time_status"
     if _creative_fast_allow_topic(normalized) or _infer_conversation_mode(normalized) in {"creative", "story"}:
         return "creative"
@@ -2216,6 +2547,8 @@ def _direct_command_kind(text: str) -> str | None:
 
 def _infer_conversation_mode(text: str, camera_intent: str = "none") -> str:
     normalized = normalize_command_text(text)
+    if _is_enrollment_request_text(normalized):
+        return "enrollment"
     conversation_markers = {
         "movie",
         "movies",
@@ -2476,6 +2809,53 @@ def _remember_accepted_turn(state: RobotRuntimeState, text: str) -> None:
         state.recent_conversation_turns = state.recent_conversation_turns[-8:]
 
 
+def _safe_log_person(state: RobotRuntimeState, fallback: str | None = None) -> str:
+    with state.lock:
+        person = _normalize_person_name(fallback or state.conversation_partner or state.recognized_person)
+    return person or "unknown"
+
+
+def _append_log_event(state: RobotRuntimeState, event_type: str, **payload) -> None:
+    with state.lock:
+        session_id = state.conversation_log_session_id
+    if not session_id:
+        return
+    try:
+        robot_memory.append_conversation_log_event(session_id, event_type, **payload)
+    except Exception as exc:
+        print("[V7.15 LOG] write warning:", exc)
+
+
+def _log_user_turn_event(state: RobotRuntimeState, user_text: str, route_hint: str = "", partner: str | None = None) -> None:
+    _append_log_event(
+        state,
+        "user_turn",
+        person=_safe_log_person(state, partner),
+        user_text=str(user_text or ""),
+        route_hint=route_hint,
+        topic=_active_creative_topic(state) or "",
+        conversation_mode=getattr(state, "conversation_mode", "general"),
+    )
+
+
+def _log_assistant_reply_event(state: RobotRuntimeState, reply_text: str, route: str) -> None:
+    with state.lock:
+        user_text = state.last_user_text
+        mode = state.conversation_mode
+        partner = state.conversation_partner or state.recognized_person
+        topic = state.session_focus or state.last_topic or ""
+    _append_log_event(
+        state,
+        "turn",
+        person=_normalize_person_name(partner) or "unknown",
+        user_text=str(user_text or ""),
+        assistant_reply=str(reply_text or ""),
+        route=route,
+        topic=topic,
+        conversation_mode=mode,
+    )
+
+
 def _update_active_topic_from_text(state: RobotRuntimeState, text: str) -> dict | None:
     topic = _extract_creative_topic(text)
     if not topic:
@@ -2619,6 +2999,42 @@ def _creative_fast_allow_topic(text: str) -> str | None:
     if "story" in normalized:
         return "story"
     return "creative"
+
+
+def _looks_like_asr_ambiguous_creative_text(text: str, state: RobotRuntimeState) -> bool:
+    normalized = normalize_command_text(text)
+    if not normalized:
+        return False
+    with state.lock:
+        mode = state.conversation_mode
+        topic = " ".join(
+            str(part or "")
+            for part in (
+                state.session_focus,
+                state.last_topic,
+                _topic_log_label(state.active_topic),
+            )
+        ).lower()
+    if mode not in {"creative", "story"} and not any(marker in topic for marker in {"hero", "superhero"}):
+        return False
+    if re.search(r"\bthe bad\b|\bbad to be\b|\bbad is useless\b|\bbath\b", normalized):
+        return True
+    if sum(1 for word in {"bat", "bad", "bash", "bath"} if re.search(rf"\b{word}\b", normalized)) >= 2:
+        return True
+    return False
+
+
+def _route_asr_ambiguity_clarification(user_text: str, state: RobotRuntimeState) -> bool:
+    if not is_conversation_active(state):
+        return False
+    if not _looks_like_asr_ambiguous_creative_text(user_text, state):
+        return False
+    extend_conversation_session(state, seconds=20.0, reason="asr_clarification")
+    _set_reply_context(state, "clarification")
+    _set_response_length_context(state, "terse")
+    print(f"[V7.15 ASR] clarification text={_short_log_text(user_text)}")
+    v6.speak("Did you mean bat, bash, or bad?")
+    return True
 
 
 def _safety_guard_route_reason(text: str, route_hint: str | None = None, conversation_mode: str | None = None) -> tuple[bool, str]:
@@ -2997,13 +3413,19 @@ def _with_cloud_reply_instructions(
     conversation_mode: str = "general",
     response_depth_mode: str = "normal",
     active_topic: str = "",
+    allowed_languages: list[str] | None = None,
 ) -> str:
     prompt = _with_response_length_instruction(user_text, mode)
     depth = str(response_depth_mode or "normal").strip().lower()
+    allowed_languages = allowed_languages or _default_allowed_conversation_languages()
+    prompt += (
+        "\nMiguel language instruction: Reply only in "
+        f"{_format_language_list(allowed_languages)} unless the user changes the language filter."
+    )
     if route_hint == "creative" or conversation_mode in {"creative", "story"}:
         prompt += (
             "\nMiguel creative instruction: Continue and add to the idea without unnecessary clarification. "
-            "Use vivid but concise child-safe details. Suggest 2 to 4 creative options when useful."
+            "Use vivid but concise child-safe details. Usually give one strong idea or at most two options."
         )
     if depth == "long_story" and (route_hint == "creative" or conversation_mode in {"creative", "story"}):
         topic_line = f" Current creative topic: {active_topic}." if active_topic else ""
@@ -3020,6 +3442,23 @@ def _with_cloud_reply_instructions(
             "natural and easy to follow."
         )
     return prompt
+
+
+def _live_conversation_context_for_cloud(state: RobotRuntimeState) -> str:
+    with state.lock:
+        partner = _normalize_person_name(state.conversation_partner or state.recognized_person)
+        mode = state.conversation_mode
+        topic = state.session_focus or state.last_topic or ""
+        recent_turns = list(state.recent_conversation_turns[-6:])
+    parts = [
+        f"conversation_mode={mode or 'general'}",
+        f"current_person={partner or 'unknown'}",
+    ]
+    if topic:
+        parts.append(f"current_topic={topic}")
+    if recent_turns:
+        parts.append("recent_user_turns=" + " | ".join(recent_turns))
+    return "\nMiguel live conversation context: " + "; ".join(parts)
 
 
 def _is_global_without_wake_command(text: str) -> bool:
@@ -3097,11 +3536,20 @@ def _short_answer_after_robot_question(text: str, state: RobotRuntimeState) -> b
     normalized = normalize_command_text(text)
     if not normalized:
         return False
+    low_signal = {
+        "and i will figure",
+        "i will figure",
+        "i will figure it out",
+        "let me figure",
+        "let me figure it out",
+    }
+    if normalized in low_signal:
+        return False
     with state.lock:
         prompt_type = state.last_prompt_type
         question_type = state.last_robot_question_type
         asked_at = state.last_robot_question_at
-    if not (prompt_type or question_type or (asked_at and time.time() - asked_at < 45.0)):
+    if not (prompt_type or question_type or (asked_at and time.time() - asked_at < 20.0)):
         return False
     return _word_count(normalized) <= 4
 
@@ -3206,6 +3654,9 @@ def is_directed_to_miguel(text: str, state: RobotRuntimeState) -> bool:
     normalized = normalize_command_text(text)
     if not normalized:
         return False
+    raw = str(text or "").lower().strip(" .,:;!?")
+    if raw in {"não", "nao", "tare"}:
+        return False
     if _has_v7_5_wake_phrase(text) or "miguel" in normalized.split():
         return True
     with state.lock:
@@ -3218,6 +3669,8 @@ def is_directed_to_miguel(text: str, state: RobotRuntimeState) -> bool:
     if active:
         with state.lock:
             long_story_active = bool(state.long_story_active)
+        if _is_enrollment_request_text(text):
+            return True
         if long_story_active and _is_long_mode_continue(text):
             return True
         words = set(normalized.split())
@@ -3596,6 +4049,37 @@ def _route_repeat_last_reply(user_text: str, state: RobotRuntimeState) -> bool:
     _set_reply_context(state, "repeat")
     _set_transient_response_length_context(state, "normal")
     v6.speak(last_spoken or "I do not have a previous reply to repeat.")
+    return True
+
+
+def _route_last_answer_clarification(user_text: str, state: RobotRuntimeState) -> bool:
+    normalized = normalize_command_text(user_text)
+    if not any(
+        marker in normalized
+        for marker in {
+            "what do you mean",
+            "what did you mean",
+            "explain what you meant",
+            "explain that",
+            "what means",
+        }
+    ):
+        return False
+    with state.lock:
+        route = state.last_answer_route or ""
+        previous = state.last_answer_text_short or state.last_robot_text or ""
+        age = time.time() - float(state.last_answer_at or 0.0) if state.last_answer_at else 9999.0
+    if not previous or age > 120.0:
+        return False
+    _set_reply_context(state, "clarification")
+    _set_transient_response_length_context(state, "normal")
+    if route == "scene" or "visible" in normalize_command_text(previous):
+        v6.speak("I meant the camera could only see part of the view, so I could not confidently describe the whole person or object.")
+        return True
+    if route == "identity":
+        v6.speak("I meant the face recognition was uncertain, so I should not claim a name unless the camera confirms it clearly.")
+        return True
+    v6.speak(f"I meant this: {previous}")
     return True
 
 
@@ -4021,6 +4505,8 @@ def _route_capabilities_local_reply(user_text: str, state: RobotRuntimeState) ->
             "Here are commands I can actually handle. Say Hey Miguel or Hello Miguel to start talking. "
             "Ask can you hear me or can you hear us. Say set a timer for five minutes, cancel timer, or timer status. "
             "Ask for a joke or science joke. Ask what do you see, can you see me, who am I, who do you see, or can you see both faces. "
+            "Ask what were our recent topics, list previous topics, or analyze the conversation log for improvements and safety review. "
+            "For face quality, say re-enroll Marco or re-enroll Marquinho. For a new friend, say enroll a new friend, then give the name and owner approval. "
             "Say creative mode, then ask for superhero, machine, or sci-fi ideas. Say long story mode, continue chapter four, "
             "long explanation mode, normal mode, or keep it short. Ask about Marco and Marquinho's project roles. "
             "Owner mode needs the secret phrase, which I will not reveal. I also support sleep mode, wake mode, and shutdown with explicit confirmation. "
@@ -4031,9 +4517,156 @@ def _route_capabilities_local_reply(user_text: str, state: RobotRuntimeState) ->
     _set_transient_response_length_context(state, "normal")
     v6.speak(
         "I can talk, recognize Marco and Marquinho, describe the camera view, set timers, tell jokes, "
-        "invent superheroes and machines, and explain things. Say creative mode for ideas or ask for a detailed command list."
+        "remember recent topics, analyze conversation logs, guide face enrollment and re-enrollment, invent superheroes and machines, and explain things. "
+        "Say creative mode for ideas or ask for a detailed command list."
     )
     return True
+
+
+def _is_recent_conversation_topics_request(user_text: str) -> bool:
+    normalized = normalize_command_text(user_text)
+    phrases = {
+        "recent topics",
+        "previous topics",
+        "what were our recent topics",
+        "what did we talk about",
+        "what did we discuss",
+        "list recent topics",
+        "list previous topics",
+        "conversation history",
+        "interaction history",
+    }
+    return normalized in phrases or any(phrase in normalized for phrase in phrases)
+
+
+def _is_conversation_log_analysis_request(user_text: str) -> bool:
+    normalized = normalize_command_text(user_text)
+    return any(
+        phrase in normalized
+        for phrase in {
+            "analyze conversation",
+            "analyze the conversation",
+            "analyze interaction",
+            "analyze the interaction",
+            "analyze conversation log",
+            "analyze the conversation log",
+            "analyze previous log",
+            "analyze the previous log",
+            "analyze previous interaction",
+            "analyze previous interactions",
+            "analyze previous conversation",
+            "analyze the previous conversation",
+            "review conversation log",
+            "review previous log",
+            "summarize conversation log",
+            "summarize the conversation",
+            "summarize previous log",
+            "summarize previous conversation",
+            "what can we improve from the log",
+            "any inappropriate topic",
+        }
+    )
+
+
+def _is_conversation_log_location_request(user_text: str) -> bool:
+    normalized = normalize_command_text(user_text)
+    return any(
+        phrase in normalized
+        for phrase in {
+            "where is the log",
+            "where are the logs",
+            "log file",
+            "conversation log file",
+            "you have a log file",
+            "there is a log file",
+            "where do you save logs",
+            "where are conversation logs",
+        }
+    )
+
+
+def _compact_logs_for_cloud(logs: list[dict], max_chars: int = 14000) -> str:
+    payload = []
+    for log in logs:
+        metadata = log.get("metadata", {})
+        events = []
+        for event in log.get("events", []):
+            if event.get("type") not in {"user_turn", "turn", "session_start"}:
+                continue
+            events.append({
+                "type": event.get("type"),
+                "created_at": event.get("created_at"),
+                "person": event.get("person"),
+                "user_text": event.get("user_text"),
+                "assistant_reply": event.get("assistant_reply"),
+                "route": event.get("route") or event.get("route_hint"),
+                "topic": event.get("topic"),
+                "conversation_mode": event.get("conversation_mode"),
+            })
+        payload.append({"metadata": metadata, "events": events[-80:]})
+    text = json.dumps(payload, ensure_ascii=False)
+    if len(text) > max_chars:
+        return text[-max_chars:]
+    return text
+
+
+def _analyze_conversation_logs_with_cloud(user_text: str, state: RobotRuntimeState) -> str:
+    normalized = normalize_command_text(user_text)
+    previous_only = any(marker in normalized for marker in {"previous", "last log", "last interaction", "last conversation"})
+    with state.lock:
+        current_session_id = state.conversation_log_session_id
+    if previous_only:
+        candidates = [
+            log for log in robot_memory.list_conversation_logs(limit=8)
+            if log.get("session_id") != current_session_id and int(log.get("turn_count") or 0) > 0
+        ]
+        logs = [
+            {
+                "metadata": log,
+                "events": robot_memory._read_jsonl(Path(log["path"])),
+            }
+            for log in candidates[:3]
+        ]
+    else:
+        logs = robot_memory.load_conversation_log(limit=3)
+    if not logs:
+        return "I do not have conversation logs yet."
+    log_text = _compact_logs_for_cloud(logs)
+    instructions = (
+        "You analyze Miguel robot conversation logs. Give a short spoken summary with: "
+        "conversation summary, what worked well, functional flaws or fixes, improvement ideas, "
+        "and whether any inappropriate or sensitive topic appeared. Be concrete and concise."
+    )
+    try:
+        response = v6.client.responses.create(
+            model=getattr(v6, "OPENAI_MODEL", "gpt-4o-mini"),
+            instructions=instructions,
+            input=json.dumps({"user_request": user_text, "logs": log_text}, ensure_ascii=False),
+        )
+        return response.output_text.strip()
+    except Exception as exc:
+        print("[V7.15 LOG ANALYSIS] cloud warning:", exc)
+        return "I could not analyze the log with the cloud brain right now."
+
+
+def _route_conversation_memory_local_reply(user_text: str, state: RobotRuntimeState) -> bool:
+    if _is_recent_conversation_topics_request(user_text):
+        _set_reply_context(state, "memory")
+        _set_transient_response_length_context(state, "normal")
+        v6.speak(robot_memory.format_recent_conversation_topics(limit=6))
+        return True
+    if _is_conversation_log_location_request(user_text) and not _is_conversation_log_analysis_request(user_text):
+        _set_reply_context(state, "memory")
+        _set_transient_response_length_context(state, "normal")
+        v6.speak("I save conversation logs in week3 memory conversation logs. Ask me to analyze the previous log or list recent topics.")
+        return True
+    if _is_conversation_log_analysis_request(user_text):
+        _set_reply_context(state, "memory_analysis")
+        _set_transient_response_length_context(state, "detailed")
+        reply = _analyze_conversation_logs_with_cloud(user_text, state)
+        v6.speak(reply)
+        return True
+    return False
 
 
 def _extract_long_story_topic(user_text: str) -> str:
@@ -4139,7 +4772,7 @@ def _route_long_story_mode(user_text: str, state: RobotRuntimeState) -> bool:
 
 
 def _choose_first_direct_command(user_text: str) -> str:
-    priority_order = ("shutdown", "sleep", "owner", "timer", "voice", "time_status", "camera_identity", "camera_scene", "creative", "enrollment", "general")
+    priority_order = ("shutdown", "sleep", "owner", "timer", "voice", "memory", "capabilities", "time_status", "camera_identity", "camera_scene", "creative", "enrollment", "general")
     parts = [part.strip() for part in re.split(r"[.!?;]+", str(user_text or "")) if part.strip()]
     if len(parts) <= 1:
         normalized = normalize_command_text(user_text)
@@ -4208,8 +4841,19 @@ def _choose_first_direct_command(user_text: str) -> str:
             ("time_status", "current time"),
             ("time_status", "weather"),
             ("time_status", "calculate"),
-            ("time_status", "can you see me"),
             ("time_status", "status"),
+            ("memory", "recent topics"),
+            ("memory", "previous topics"),
+            ("memory", "conversation history"),
+            ("memory", "analyze conversation log"),
+            ("memory", "analyze conversation"),
+            ("memory", "analyze the previous log"),
+            ("memory", "analyze previous log"),
+            ("memory", "previous log"),
+            ("memory", "log file"),
+            ("capabilities", "what can you do"),
+            ("capabilities", "what are your capabilities"),
+            ("capabilities", "capabilities"),
             ("creative", "creative mode"),
             ("creative", "be creative"),
             ("creative", "superhero"),
@@ -4217,6 +4861,11 @@ def _choose_first_direct_command(user_text: str) -> str:
             ("enrollment", "learn this face"),
             ("enrollment", "add a new face"),
             ("enrollment", "enroll a new person"),
+            ("enrollment", "start enrollment"),
+            ("enrollment", "start enrollment for"),
+            ("enrollment", "re enroll"),
+            ("enrollment", "reenroll"),
+            ("enrollment", "reinrou"),
             ("enrollment", "remember this person"),
             ("general", "how are you"),
             ("general", "what are you"),
@@ -4291,9 +4940,16 @@ def _should_drop_filler_transcript(text: str, state: RobotRuntimeState, camera_i
         "uh",
         "um",
         "wow",
+        "oh my god",
+        "omg",
+        "ugh",
+        "ai meu deus",
         "wow didn t you",
         "si",
         "sí",
+        "não",
+        "nao",
+        "tare",
         "ok",
         "okay",
         "hi buddy",
@@ -4377,6 +5033,15 @@ def _is_owner_natural_direct_command(text: str) -> bool:
         "what time is it",
         "current time",
         "status",
+        "recent topics",
+        "previous topics",
+        "conversation history",
+        "interaction history",
+        "analyze conversation",
+        "analyze conversation log",
+        "analyze previous log",
+        "previous log",
+        "log file",
         "owner mode",
         "unlock owner mode",
         "is password mode configured",
@@ -4630,6 +5295,21 @@ def _route_fast_local_reply(user_text: str, state: RobotRuntimeState) -> bool:
         v6.speak("Creative mode activated. I can make up heroes, machines, stories, and wild ideas.")
         return True
 
+    if normalized in {
+        "conversation mode",
+        "conversational mode",
+        "go to conversation mode",
+        "go in conversation mode",
+        "go to conversational mode",
+        "go in conversational mode",
+        "can you go to conversation mode",
+        "can you go to conversational mode",
+    }:
+        _force_active_after_mode(state, "general", reason="conversation_mode")
+        _set_response_length_context(state, "normal")
+        v6.speak("Conversation mode on.")
+        return True
+
     if _is_mode_command_not_physical(normalized) and any(marker in normalized for marker in {"robot project", "project mode"}):
         _force_active_after_mode(state, "project", reason="project_mode")
         _set_response_length_context(state, "normal")
@@ -4727,6 +5407,8 @@ def _route_project_local_reply(user_text: str, state: RobotRuntimeState) -> bool
     role_followup_reply = "Yes - Marco is the Systems Engineer, and Marquinho is the Chief Engineer. Both of you are Mission Control."
 
     role_questions = {
+        "who am i in this project",
+        "who am i on this project",
         "what is my role",
         "what is my role in this project",
         "do you know my role",
@@ -4817,6 +5499,44 @@ def _route_project_local_reply(user_text: str, state: RobotRuntimeState) -> bool
         return True
 
     return False
+
+
+def _is_project_role_request(user_text: str) -> bool:
+    normalized = normalize_command_text(user_text)
+    role_markers = {
+        "who am i in this project",
+        "who am i on this project",
+        "what is my role",
+        "what is my role in this project",
+        "what is my role on this project",
+        "do you know my role",
+    }
+    return any(marker in normalized for marker in role_markers)
+
+
+def _is_location_question(user_text: str) -> bool:
+    normalized = normalize_command_text(user_text)
+    phrases = {
+        "where are we",
+        "where we are",
+        "which location are we here",
+        "what location are we",
+        "what location are we in",
+        "do you know which location",
+        "do you know where we are",
+    }
+    return any(phrase in normalized for phrase in phrases)
+
+
+def _route_location_local_reply(user_text: str, state: RobotRuntimeState) -> bool:
+    if not _is_location_question(user_text):
+        return False
+    location = os.getenv("MIGUEL_LOCATION_NAME", "").strip()
+    if location:
+        v6.speak(f"We are at {location}.")
+    else:
+        v6.speak("I do not have a GPS or saved room location yet. I only know I am running on the Jetson.")
+    return True
 
 
 LOCAL_JOKES = [
@@ -4958,6 +5678,9 @@ def _has_clear_non_shutdown_command(text: str) -> bool:
         "what time",
         "time is it",
         "status",
+        "recent topics",
+        "previous topics",
+        "analyze conversation",
     ]
     return any(marker in normalized for marker in command_markers)
 
@@ -5175,8 +5898,28 @@ def _multi_face_identity_trigger(user_text: str) -> str:
         "can you see both faces",
         "can you recognize the faces",
         "who are those faces",
+        "who are those two",
+        "who are those two people",
+        "who are these two",
+        "who are these two people",
+        "who are those people",
+        "who are these people",
+        "who are the two people",
+        "who are both people",
+        "who are both of us",
+        "who are they",
         "who are the faces",
         "who are the people",
+        "identify the people",
+        "identify those people",
+        "identify these people",
+        "who else is there",
+        "anybody else",
+        "see any other face",
+        "any other face besides me",
+        "other face besides me",
+        "anyone behind me",
+        "anybody behind me",
         "who is there",
         "who is with me",
         "do you recognize both of us",
@@ -5185,6 +5928,14 @@ def _multi_face_identity_trigger(user_text: str) -> str:
         "is marco there",
         "can you see marco",
         "can you see marquinho",
+        "who is this face",
+        "who is that face",
+        "who is his face",
+        "who is her face",
+        "who is this child",
+        "who is that child",
+        "identify this face",
+        "whose face is this",
     }
     return "multi_face" if any(trigger in normalized for trigger in triggers) else ""
 
@@ -5204,6 +5955,14 @@ def _expanded_identity_trigger(user_text: str) -> str:
         "am i visible": "short_see_me",
         "can you recognize me now": "short_see_me",
         "who is this person": "who_is_this_person",
+        "who is this face": "who_is_this_face",
+        "who is that face": "who_is_this_face",
+        "who is his face": "who_is_this_face",
+        "who is her face": "who_is_this_face",
+        "who is this child": "who_is_this_face",
+        "who is that child": "who_is_this_face",
+        "identify this face": "who_is_this_face",
+        "whose face is this": "who_is_this_face",
         "who do you see": "who_do_you_see",
         "do you see me": "do_you_see_me",
         "do you see a face": "do_you_see_a_face",
@@ -5229,6 +5988,81 @@ def _known_identity_names() -> set[str]:
     return {name for name in names if name}
 
 
+IDENTITY_ACCEPTANCE_THRESHOLDS = {
+    "marco": {
+        "votes": 2,
+        "score": 0.60,
+        "margin": 0.08,
+        "strong_score": 0.75,
+        "strong_margin": 0.12,
+        "owner_score": 0.65,
+        "owner_margin": 0.10,
+    },
+    "marquinho": {
+        "votes": 2,
+        "score": 0.58,
+        "margin": 0.24,
+        "strong_score": 0.68,
+        "strong_margin": 0.34,
+        "owner_score": 0.60,
+        "owner_margin": 0.24,
+    },
+}
+
+
+def _identity_thresholds_for(person: str | None) -> dict:
+    normalized = _normalize_person_name(person)
+    return IDENTITY_ACCEPTANCE_THRESHOLDS.get(
+        normalized,
+        {
+            "votes": 2,
+            "score": 0.62,
+            "margin": 0.10,
+            "strong_score": 0.76,
+            "strong_margin": 0.14,
+            "owner_score": 0.68,
+            "owner_margin": 0.12,
+        },
+    )
+
+
+def _identity_candidate_accepted(
+    person: str | None,
+    votes: int,
+    avg_score: float | None,
+    avg_margin: float | None,
+    *,
+    owner_context: bool = False,
+    single_frame: bool = False,
+) -> bool:
+    normalized = _normalize_person_name(person)
+    if not normalized:
+        return False
+    thresholds = _identity_thresholds_for(normalized)
+    try:
+        score = float(avg_score or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    try:
+        margin = float(avg_margin or 0.0)
+    except (TypeError, ValueError):
+        margin = 0.0
+    try:
+        vote_count = int(votes or 0)
+    except (TypeError, ValueError):
+        vote_count = 0
+
+    if owner_context:
+        return vote_count >= 2 and score >= thresholds["owner_score"] and margin >= thresholds["owner_margin"]
+    if single_frame:
+        return score >= thresholds["strong_score"] and margin >= thresholds["strong_margin"]
+    return (
+        vote_count >= thresholds["votes"]
+        and score >= thresholds["score"]
+        and margin >= thresholds["margin"]
+    ) or (score >= thresholds["strong_score"] and margin >= thresholds["strong_margin"])
+
+
 def _stable_identity_reply_state(
     face_detected: bool,
     recognized_person: str | None = None,
@@ -5249,7 +6083,7 @@ def _stable_identity_reply_state(
     }
 
 
-def get_stable_identity_for_reply(camera_manager, timeout_seconds: float = 1.0) -> dict:
+def get_stable_identity_for_reply(camera_manager, timeout_seconds: float = 2.2) -> dict:
     tracker = getattr(camera_manager, "identity_tracker", None)
     deadline = time.time() + float(timeout_seconds)
     known_names = _known_identity_names()
@@ -5260,12 +6094,20 @@ def get_stable_identity_for_reply(camera_manager, timeout_seconds: float = 1.0) 
         raw_state = camera_manager.get_face_state(max_age_seconds=1.0)
         face_detected = face_detected or bool(raw_state.get("face_detected"))
         raw_age = _face_state_age(raw_state)
-        if raw_state.get("recognized_person") and raw_age is not None and raw_age < 1.0:
+        raw_person = _normalize_person_name(raw_state.get("recognized_person"))
+        raw_score = raw_state.get("recognition_score")
+        raw_margin = raw_state.get("recognition_margin")
+        if (
+            raw_person
+            and raw_age is not None
+            and raw_age < 1.0
+            and _identity_candidate_accepted(raw_person, 1, raw_score, raw_margin, single_frame=True)
+        ):
             return _stable_identity_reply_state(
                 face_detected=True,
-                recognized_person=_normalize_person_name(raw_state.get("recognized_person")),
-                recognition_score=raw_state.get("recognition_score"),
-                recognition_margin=raw_state.get("recognition_margin"),
+                recognized_person=raw_person,
+                recognition_score=raw_score,
+                recognition_margin=raw_margin,
                 recognition_votes=1,
             )
 
@@ -5284,9 +6126,13 @@ def get_stable_identity_for_reply(camera_manager, timeout_seconds: float = 1.0) 
         accepted = False
 
         if candidate_known:
-            accepted = (votes >= 2 and avg_score >= 0.55) or (avg_score >= 0.75 and avg_margin >= 0.10)
-            if is_owner:
-                accepted = avg_score >= 0.55 and avg_margin >= 0.10 and face_detected
+            accepted = _identity_candidate_accepted(
+                person,
+                votes,
+                avg_score,
+                avg_margin,
+                owner_context=is_owner,
+            ) and face_detected
 
         if accepted:
             return _stable_identity_reply_state(
@@ -5308,7 +6154,7 @@ def get_stable_identity_for_reply(camera_manager, timeout_seconds: float = 1.0) 
     return _stable_identity_reply_state(face_detected=False)
 
 
-def _fresh_identity_state_for_route(camera_manager, timeout_seconds: float = 1.0) -> dict:
+def _fresh_identity_state_for_route(camera_manager, timeout_seconds: float = 2.2) -> dict:
     cached_state = camera_manager.get_face_state(max_age_seconds=1.0)
     cached_age = _face_state_age(cached_state)
     needs_fresh_wait = (
@@ -5320,7 +6166,7 @@ def _fresh_identity_state_for_route(camera_manager, timeout_seconds: float = 1.0
     )
     if needs_fresh_wait:
         print("[V7.14 IDENTITY] waiting_for_fresh_face")
-    face_state = get_stable_identity_for_reply(camera_manager, timeout_seconds=timeout_seconds if needs_fresh_wait else 0.2)
+    face_state = get_stable_identity_for_reply(camera_manager, timeout_seconds=timeout_seconds if needs_fresh_wait else 0.8)
     print(
         "[V7.14 IDENTITY] fresh_face_result="
         f"recognized={face_state.get('recognized_person')} detected={face_state.get('face_detected')}"
@@ -5340,6 +6186,8 @@ def _recognized_names_from_face_state(face_state: dict) -> list[str]:
     person = _normalize_person_name(face_state.get("recognized_person"))
     if person:
         names.append(person)
+    if _face_count_from_state(face_state) < 2:
+        return names[:1]
     scores = face_state.get("recognition_scores")
     if isinstance(scores, dict):
         for name, score in scores.items():
@@ -5422,7 +6270,7 @@ def _face_status_reply(face_state: dict, prefix: str = "") -> str:
         visible_name = person.replace("_", " ").title()
         return f"{prefix}I see {visible_name}.".strip()
     if face_state.get("face_detected"):
-        return f"{prefix}I see a face, but I'm not sure who.".strip()
+        return f"{prefix}I see a face, but recognition is still stabilizing. Hold still.".strip()
     if prefix:
         if prefix.strip().lower().startswith("i took a fresh look"):
             return "I took a fresh look, but I don't see a face right now."
@@ -5488,8 +6336,11 @@ def _route_identity_camera_intent(
     if expanded_trigger == "multi_face":
         face_state = _fresh_multi_face_state_for_route(camera_manager, state, timeout_seconds=1.4)
         reply = _multi_face_status_reply(face_state)
+        if any(marker in normalize_command_text(user_text) for marker in {"doing", "what are", "what is happening"}):
+            scene_reply = full.build_scene_reply(camera_manager)
+            reply = f"{reply} {_trim_scene_reply(scene_reply, 18)}"
     else:
-        face_state = _fresh_identity_state_for_route(camera_manager, timeout_seconds=1.0)
+        face_state = _fresh_identity_state_for_route(camera_manager, timeout_seconds=2.2)
         reply = _face_status_reply(face_state) if expanded_trigger else full.build_identity_reply(face_state)
     _set_reply_context(state, "identity")
     v6.speak(reply)
@@ -5527,7 +6378,7 @@ def _route_camera_refresh(user_text: str, camera_manager: full.CameraManager, st
         v6.speak("Camera refresh is unavailable right now.")
         return True
 
-    face_state = _fresh_identity_state_for_route(camera_manager, timeout_seconds=1.0)
+    face_state = _fresh_identity_state_for_route(camera_manager, timeout_seconds=2.2)
     result = "recognized" if face_state.get("recognized_person") else "face_unknown" if face_state.get("face_detected") else "no_face"
     print(f"[V7.14 CAMERA] refresh_result={result}")
     _set_reply_context(state, "camera_refresh")
@@ -5580,11 +6431,31 @@ def _route_enrollment(user_text: str, state: RobotRuntimeState, camera_manager: 
     recognized = face_state.get("recognized_person")
     approval_name = _extract_enrollment_approval_name(user_text)
 
+    if _is_reenrollment_request_text(user_text):
+        target = _normalize_enrollment_target(_extract_reenrollment_name(user_text, state))
+        if not target or target == "charlie":
+            v6.speak("Who should I re-enroll? Say re-enroll Marco or re-enroll Marquinho.")
+            return True
+        recognized, face_state = _wait_for_owner_approval_face(camera_manager, state)
+        if not _is_owner(recognized):
+            v6.speak("Re-enrollment needs Marco or Marquinho visible for approval.")
+            return True
+        with state.lock:
+            state.enrollment_state = "approved_pending_subject"
+            state.enrollment_target_name = target
+            state.enrollment_approved_by = _normalize_person_name(recognized)
+            state.enrollment_approved_at = time.time()
+        v6.speak(
+            f"Approved. I will improve face recognition for {target.title()}. "
+            "I will ask for a few positions and save a fresh embedding set."
+        )
+        return _run_enrollment_capture(camera_manager, state)
+
     if approval_name:
         with state.lock:
             active_target = state.enrollment_target_name
         target = _normalize_enrollment_target(active_target or approval_name)
-        if _is_protected_identity(target):
+        if _is_protected_identity(target) and target != _normalize_person_name(approval_name):
             _reset_enrollment_state(state)
             v6.speak("I will not overwrite Marco or Marquinho.")
             return True
@@ -5692,6 +6563,12 @@ def _log_approval_face_state(face_state: dict) -> None:
 def _wait_for_owner_approval_face(camera_manager: full.CameraManager, state: RobotRuntimeState):
     deadline = time.time() + 2.0
     face_state = None
+    current_owner = _current_owner_partner(state)
+    if _is_owner(current_owner):
+        face_state = dict(camera_manager.get_face_state(max_age_seconds=2.0))
+        face_state["recognized_person"] = current_owner
+        _log_approval_face_state(face_state)
+        return current_owner, face_state
 
     while True:
         face_state = state.identity_tracker.get_owner_authorization_identity(max_age_seconds=3.0)
@@ -5705,7 +6582,8 @@ def _wait_for_owner_approval_face(camera_manager: full.CameraManager, state: Rob
 
     if not face_state:
         face_state = dict(camera_manager.get_face_state(max_age_seconds=1.0))
-        face_state["recognized_person"] = None
+        fallback_owner = _current_owner_partner(state)
+        face_state["recognized_person"] = fallback_owner if _is_owner(fallback_owner) else None
 
     _log_approval_face_state(face_state)
     recognized = face_state.get("recognized_person")
@@ -5741,6 +6619,24 @@ def _is_enrollment_request_text(text: str) -> bool:
         "approved enrolling",
         "approved enroll",
         "approved in rolling",
+        "start enrollment",
+        "start enrollment for",
+        "start face enrollment",
+        "re enroll",
+        "re enrol",
+        "reenroll",
+        "reenrol",
+        "re-enroll",
+        "reinrou",
+        "reinroll",
+        "update my face",
+        "update face recognition",
+        "improve face recognition",
+        "improve my face recognition",
+        "improve marquinho face recognition",
+        "improve marco face recognition",
+        "retrain my face",
+        "retrain face",
     }
     if any(phrase in t for phrase in explicit_phrases):
         return True
@@ -5749,6 +6645,41 @@ def _is_enrollment_request_text(text: str) -> bool:
         or re.search(r"\badd my friend\s+[a-zA-Z][a-zA-Z_-]*\b", t)
         or re.search(r"\badd (?:a )?friend\s+[a-zA-Z][a-zA-Z_-]*\b", t)
     )
+
+
+def _is_reenrollment_request_text(text: str) -> bool:
+    t = normalize_command_text(text)
+    protected_target = any(name in t or name.replace("_", " ") in t for name in {"marco", "marquinho"})
+    return any(
+        phrase in t
+        for phrase in {
+            "re enroll",
+            "re enrol",
+            "reenroll",
+            "reenrol",
+            "re-enroll",
+            "reinrou",
+            "reinroll",
+            "update my face",
+            "update face recognition",
+            "improve face recognition",
+            "improve my face recognition",
+            "retrain my face",
+            "retrain face",
+        }
+    ) or (protected_target and any(phrase in t for phrase in {"start enrollment", "start face enrollment", "enrollment for"}))
+
+
+def _extract_reenrollment_name(user_text: str, state: RobotRuntimeState) -> str | None:
+    normalized = normalize_command_text(user_text)
+    for name in _known_identity_names():
+        display = name.replace("_", " ")
+        if name in normalized or display in normalized:
+            return name
+    if any(marker in normalized for marker in {"my face", "me", "my recognition", "face recognition"}):
+        with state.lock:
+            return _normalize_person_name(state.recognized_person or state.conversation_partner)
+    return None
 
 
 def _extract_enrollment_approval_name(user_text: str) -> str | None:
@@ -5809,7 +6740,7 @@ def _next_embedding_index(person_dir: Path) -> int:
     return (max(existing) + 1) if existing else 1
 
 
-def _evaluate_enrollment_frame(frame, target_name: str):
+def _evaluate_enrollment_frame(frame, target_name: str, allow_protected_target: bool = False):
     h, w = frame.shape[:2]
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     brightness = float(np.mean(gray))
@@ -5846,7 +6777,10 @@ def _evaluate_enrollment_frame(frame, target_name: str):
         return None, "off_center", "Move a little closer to the center."
 
     matched_name, score, _margin, _scores = v6.recognize_insight_embedding(face.embedding)
-    if _is_protected_identity(matched_name) and score >= 0.48:
+    matched_normalized = _normalize_person_name(matched_name)
+    target_normalized = _normalize_person_name(target_name)
+    same_protected_target = allow_protected_target and matched_normalized == target_normalized
+    if _is_protected_identity(matched_name) and score >= 0.48 and not same_protected_target:
         return None, "protected_identity", "This looks like a protected owner identity, so I will not enroll it as a new friend."
 
     return face, "ok", "Good, I captured that."
@@ -5862,6 +6796,39 @@ def _reload_insight_embeddings() -> None:
         v6.INSIGHT_FACE_DB = v6.load_insight_embeddings()
 
 
+def _archive_existing_embeddings(person_dir: Path, target_name: str) -> Path | None:
+    existing = sorted(person_dir.glob("emb_*.npy"))
+    if not existing:
+        return None
+    backup_dir = person_dir / "backups" / time.strftime("%Y%m%d_%H%M%S")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    for emb_path in existing:
+        shutil.move(str(emb_path), str(backup_dir / emb_path.name))
+    print(f"[V7.5 ENROLL] Archived {len(existing)} old embeddings for {target_name} to {backup_dir}")
+    return backup_dir
+
+
+def _finalize_guided_capture(
+    target_name: str,
+    person_dir: Path,
+    temp_embed_dir: Path,
+    replace_existing: bool,
+) -> int:
+    new_embeddings = sorted(temp_embed_dir.glob("emb_*.npy"))
+    if not new_embeddings:
+        return 0
+    if replace_existing:
+        _archive_existing_embeddings(person_dir, target_name)
+        next_index = 1
+    else:
+        next_index = _next_embedding_index(person_dir)
+    for emb_path in new_embeddings:
+        destination = person_dir / f"emb_{next_index:03d}.npy"
+        shutil.move(str(emb_path), str(destination))
+        next_index += 1
+    return len(new_embeddings)
+
+
 def _run_enrollment_capture(camera_manager: full.CameraManager, state: RobotRuntimeState) -> bool:
     set_interaction_state(state, "enrolling", "Enrollment capture")
     with state.lock:
@@ -5873,92 +6840,113 @@ def _run_enrollment_capture(camera_manager: full.CameraManager, state: RobotRunt
         v6.speak("Enrollment is not authorized yet.")
         return True
 
-    if _is_protected_identity(target_name):
-        _reset_enrollment_state(state)
-        v6.speak("I will not overwrite Marco or Marquinho.")
-        return True
-
     target_name = _normalize_enrollment_target(target_name)
+    replace_existing = _is_protected_identity(target_name)
     person_dir = v6.INSIGHT_EMBED_DIR / target_name
     person_dir.mkdir(parents=True, exist_ok=True)
     sample_dir = person_dir / "samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
-    next_index = _next_embedding_index(person_dir)
+    temp_dir = person_dir / f"capture_{time.strftime('%Y%m%d_%H%M%S')}"
+    temp_embed_dir = temp_dir / "embeddings"
+    temp_sample_dir = temp_dir / "samples"
+    temp_embed_dir.mkdir(parents=True, exist_ok=True)
+    temp_sample_dir.mkdir(parents=True, exist_ok=True)
+    next_index = 1
 
     with state.lock:
         state.enrollment_state = "capture_subject_samples"
 
-    instructions = [
-        f"Please put only {target_name.title()} in front of the camera.",
-        "Look straight at me.",
-        "Move a little closer.",
-        "Move a little farther back.",
-        "Turn your head slightly left.",
-        "Turn your head slightly right.",
-        "Hold still.",
+    phases = [
+        ("center", "Look straight at me and hold still.", 6),
+        ("left", "Turn your head slightly left, but keep your face visible.", 5),
+        ("right", "Turn your head slightly right, but keep your face visible.", 5),
+        ("up", "Tilt your chin slightly up.", 4),
+        ("down", "Tilt your chin slightly down.", 4),
+        ("closer", "Move a little closer.", 3),
+        ("farther", "Move a little farther back.", 3),
     ]
 
     captured = 0
-    target_samples = int(os.getenv("MIGUEL_ENROLLMENT_SAMPLE_COUNT", "24"))
-    target_samples = max(20, min(30, target_samples))
+    requested_samples = int(os.getenv("MIGUEL_ENROLLMENT_SAMPLE_COUNT", "30"))
+    target_samples = max(20, min(36, requested_samples))
+    phase_scale = target_samples / float(sum(phase[2] for phase in phases))
     start = time.time()
     last_guidance = ""
     last_guidance_at = 0.0
     last_saved_at = 0.0
 
-    _say_capture_prompt(instructions[0], pause_seconds=1.8)
-    instruction_index = 1
+    intro = "Re-enrollment" if replace_existing else "Enrollment"
+    _say_capture_prompt(
+        f"{intro} capture starting for {target_name.title()}. Please keep only that face in view.",
+        pause_seconds=1.8,
+    )
 
-    while captured < target_samples and time.time() - start < 90 and not state.stop_event.is_set():
-        with state.lock:
-            if state.enrollment_state == "idle":
-                v6.speak("Enrollment canceled.")
+    for phase_name, prompt, base_count in phases:
+        if captured >= target_samples or time.time() - start >= 120 or state.stop_event.is_set():
+            break
+        phase_target = max(2, int(round(base_count * phase_scale)))
+        phase_captured = 0
+        phase_deadline = time.time() + max(12.0, phase_target * 3.0)
+        _say_capture_prompt(prompt, pause_seconds=1.2)
+
+        while (
+            phase_captured < phase_target
+            and captured < target_samples
+            and time.time() < phase_deadline
+            and time.time() - start < 120
+            and not state.stop_event.is_set()
+        ):
+            with state.lock:
+                if state.enrollment_state == "idle":
+                    v6.speak("Enrollment canceled.")
+                    return True
+
+            snap = camera_manager.get_latest_frame(require_fresh=True, wait_timeout=1.2)
+            if snap is None:
+                now = time.time()
+                if now - last_guidance_at > 2.5:
+                    v6.speak("I do not have a fresh camera frame right now.")
+                    last_guidance_at = now
+                continue
+
+            face, status, guidance = _evaluate_enrollment_frame(
+                snap.frame,
+                target_name,
+                allow_protected_target=replace_existing,
+            )
+            now = time.time()
+
+            if status == "protected_identity":
+                _reset_enrollment_state(state)
+                v6.speak(guidance)
                 return True
 
-        snap = camera_manager.get_latest_frame(require_fresh=True, wait_timeout=1.2)
-        if snap is None:
-            now = time.time()
-            if now - last_guidance_at > 2.5:
-                v6.speak("I do not have a fresh camera frame right now.")
-                last_guidance_at = now
-            continue
+            if status != "ok":
+                if guidance != last_guidance and now - last_guidance_at > 1.8:
+                    v6.speak(guidance)
+                    last_guidance = guidance
+                    last_guidance_at = now
+                time.sleep(0.15)
+                continue
 
-        face, status, guidance = _evaluate_enrollment_frame(snap.frame, target_name)
-        now = time.time()
+            if now - last_saved_at < 0.35:
+                time.sleep(0.05)
+                continue
 
-        if status == "protected_identity":
-            _reset_enrollment_state(state)
-            v6.speak(guidance)
-            return True
+            emb = v6.insight_normalize_embedding(face.embedding)
+            emb_path = temp_embed_dir / f"emb_{next_index:03d}.npy"
+            sample_path = temp_sample_dir / f"{phase_name}_{next_index:03d}.jpg"
+            np.save(str(emb_path), emb)
+            cv2.imwrite(str(sample_path), snap.frame)
+            print(f"[V7.5 ENROLL] Saved {emb_path} and {sample_path}")
 
-        if status != "ok":
-            if guidance != last_guidance and now - last_guidance_at > 1.8:
-                v6.speak(guidance)
-                last_guidance = guidance
-                last_guidance_at = now
-            time.sleep(0.15)
-            continue
+            captured += 1
+            phase_captured += 1
+            next_index += 1
+            last_saved_at = now
 
-        if now - last_saved_at < 0.35:
-            time.sleep(0.05)
-            continue
-
-        emb = v6.insight_normalize_embedding(face.embedding)
-        emb_path = person_dir / f"emb_{next_index:03d}.npy"
-        sample_path = sample_dir / f"sample_{next_index:03d}.jpg"
-        np.save(str(emb_path), emb)
-        cv2.imwrite(str(sample_path), snap.frame)
-        print(f"[V7.5 ENROLL] Saved {emb_path} and {sample_path}")
-
-        captured += 1
-        next_index += 1
-        last_saved_at = now
-
-        if captured in {1, 6, 10, 14, 18} and instruction_index < len(instructions):
-            _say_capture_prompt(instructions[instruction_index], pause_seconds=1.0)
-            instruction_index += 1
-        elif captured % 5 == 0:
-            v6.speak("Good, I captured that.")
+        if phase_captured:
+            v6.speak(f"Good. I captured {phase_captured} for that position.")
 
     if captured < 20:
         with state.lock:
@@ -5966,11 +6954,18 @@ def _run_enrollment_capture(camera_manager: full.CameraManager, state: RobotRunt
         v6.speak("I could not capture enough good samples. We can try again with better lighting and only one face visible.")
         return True
 
+    finalized = _finalize_guided_capture(target_name, person_dir, temp_embed_dir, replace_existing)
+    try:
+        shutil.move(str(temp_sample_dir), str(sample_dir / time.strftime("guided_%Y%m%d_%H%M%S")))
+        shutil.rmtree(str(temp_dir), ignore_errors=True)
+    except Exception as exc:
+        print("[V7.5 ENROLL] sample archive warning:", exc)
+
     _reload_insight_embeddings()
     with state.lock:
         state.enrollment_state = "completed"
-    v6.speak("Enrollment complete.")
-    v6.speak(f"{target_name.title()} is now enrolled as a friend.")
+    mode_text = "Re-enrollment complete" if replace_existing else "Enrollment complete"
+    v6.speak(f"{mode_text}. I saved {finalized} guided face samples for {target_name.title()}.")
     return True
 
 
@@ -6071,6 +7066,7 @@ def face_worker(camera_manager: full.CameraManager, state: RobotRuntimeState):
                 recognized,
                 face_state.get("face_count"),
                 face_state.get("recognition_score"),
+                face_state.get("recognition_margin"),
             )
             _maybe_surface_unknown_face(state, previous_key, current_key)
 
@@ -6111,6 +7107,7 @@ def audio_worker(
                 recognized,
                 face_state.get("face_count"),
                 face_state.get("recognition_score"),
+                face_state.get("recognition_margin"),
             )
             _maybe_surface_unknown_face(state, previous_key, current_key)
 
@@ -6582,12 +7579,25 @@ def handle_queued_turn(
         with state.lock:
             state.last_topic = "Star Wars"
             state.last_topic_until = time.time() + 300.0
-    print(f"[V7.5 TRANSCRIPT] {user_text}")
-    _remember_accepted_turn(state, user_text)
-    _update_active_topic_from_text(state, user_text)
     with state.lock:
         turn_started_at = state.current_turn_latency.get("turn_started_at") or time.monotonic()
         state.current_turn_latency.setdefault("turn_started_at", turn_started_at)
+    print(f"[V7.5 TRANSCRIPT] {user_text}")
+
+    _set_reply_context(state, "language_policy")
+    if _route_language_policy_local_reply(user_text, state):
+        _set_response_length_context(state, "terse")
+        _mark_route_done(state, turn_started_at)
+        return True
+
+    if not _language_policy_allows_turn(user_text, state):
+        _mark_route_done(state, turn_started_at)
+        force_interaction_state(state, _ready_face_state(), _ready_face_text(state))
+        return True
+
+    _remember_accepted_turn(state, user_text)
+    _update_active_topic_from_text(state, user_text)
+    _log_user_turn_event(state, user_text, route_hint="accepted", partner=partner)
 
     mode = _infer_conversation_mode(user_text)
     if is_conversation_active(state) and mode not in {"general", "robot_control"}:
@@ -6612,6 +7622,8 @@ def handle_queued_turn(
         return True
 
     camera_intent = classify_camera_intent(user_text)
+    if _is_project_role_request(user_text):
+        camera_intent = "none"
     with state.lock:
         current_conversation_mode = state.conversation_mode
         saved_response_mode = state.response_length_mode
@@ -6671,6 +7683,11 @@ def handle_queued_turn(
         _mark_route_done(state, turn_started_at)
         return True
 
+    _set_reply_context(state, "clarification")
+    if _route_last_answer_clarification(user_text, state):
+        _mark_route_done(state, turn_started_at)
+        return True
+
     _set_reply_context(state, "depth_mode")
     if _route_depth_status_local_reply(user_text, state):
         _mark_route_done(state, turn_started_at)
@@ -6688,6 +7705,11 @@ def handle_queued_turn(
 
     _set_reply_context(state, "capabilities")
     if _route_capabilities_local_reply(user_text, state):
+        _mark_route_done(state, turn_started_at)
+        return True
+
+    _set_reply_context(state, "memory")
+    if _route_conversation_memory_local_reply(user_text, state):
         _mark_route_done(state, turn_started_at)
         return True
 
@@ -6719,6 +7741,12 @@ def handle_queued_turn(
 
     _set_reply_context(state, "normal")
     if _route_project_local_reply(user_text, state):
+        _mark_route_done(state, turn_started_at)
+        return True
+
+    _set_reply_context(state, "location")
+    if _route_location_local_reply(user_text, state):
+        _set_response_length_context(state, "normal")
         _mark_route_done(state, turn_started_at)
         return True
 
@@ -6775,6 +7803,10 @@ def handle_queued_turn(
     if _should_drop_filler_transcript(user_text, state, camera_intent):
         print("[V7.5 AUDIO] Dropped filler transcript.")
         set_interaction_state(state, "idle", "")
+        _mark_route_done(state, turn_started_at)
+        return True
+
+    if _route_asr_ambiguity_clarification(user_text, state):
         _mark_route_done(state, turn_started_at)
         return True
 
@@ -6869,6 +7901,7 @@ def handle_queued_turn(
         cloud_response_mode = state.current_turn_latency.get("response_length_mode", state.response_length_mode)
         cloud_conversation_mode = state.conversation_mode
         cloud_depth_mode = state.response_depth_mode
+        cloud_allowed_languages = list(state.allowed_conversation_languages or ["english"])
     cloud_route = "creative" if creative_fast_topic or cloud_conversation_mode in {"creative", "story"} else "normal"
     _set_reply_context(state, cloud_route)
     active_topic_label = _topic_log_label(_current_active_topic(state))
@@ -6879,7 +7912,9 @@ def handle_queued_turn(
         conversation_mode=cloud_conversation_mode,
         response_depth_mode=cloud_depth_mode,
         active_topic=active_topic_label,
+        allowed_languages=cloud_allowed_languages,
     )
+    cloud_user_text += _live_conversation_context_for_cloud(state)
     face_state = _neutral_conversation_face_state()
     keep_running = bool(v6.handle_user_turn_with_cached_state(cloud_user_text, face_state))
     _mark_route_done(state, turn_started_at)
@@ -6987,19 +8022,33 @@ def speech_worker(
                 try:
                     with state.lock:
                         state.is_speaking = True
+                        state.last_spoken_text = text
+                        state.last_robot_text = text
+                    _log_latency("tts_prepare_started", latency.get("turn_started_at"))
+                    prepared = None
+                    can_prepare = callable(getattr(v6, "prepare_speech_audio", None)) and callable(getattr(v6, "play_prepared_speech", None))
+                    if can_prepare:
+                        try:
+                            prepared = v6.prepare_speech_audio(text)
+                        except Exception as exc:
+                            print("[V7.5 SPEECH] TTS prepare failed; falling back:", exc)
+                            can_prepare = False
+                    with state.lock:
                         now = time.time()
                         state.last_speech_started_at = now
                         state.last_speaking_started_at = now
-                        state.last_spoken_text = text
-                        state.last_robot_text = text
                     _log_latency("speak_started", latency.get("turn_started_at"))
                     set_interaction_state(state, "speaking", text[:48])
                     speak_started = time.monotonic()
-                    original_speak(text)
+                    if can_prepare:
+                        v6.play_prepared_speech(prepared)
+                    else:
+                        original_speak(text)
                     speak_finished = time.monotonic()
                     _log_latency("speak_finished", latency.get("turn_started_at"))
                     _log_latency_summary(latency, text, speak_started, speak_finished)
                     _update_prompt_state(text, state)
+                    _log_assistant_reply_event(state, text, route)
                     with state.lock:
                         answer_topic = state.session_focus or state.last_topic or ""
                         last_user = state.last_user_text
@@ -7029,8 +8078,13 @@ def speech_worker(
                     else:
                         set_interaction_state(state, "idle", "")
         except Exception as exc:
-            print("[V7.5 SPEECH] error:", exc)
-            set_interaction_state(state, "error", str(exc)[:48])
+            message = str(exc)
+            aplay_interrupted = "Command '['aplay'" in message and "exit status 1" in message
+            if state.stop_event.is_set() or "Interrupted system call" in message or aplay_interrupted:
+                print("[V7.5 SPEECH] playback interrupted during shutdown/stop.")
+            else:
+                print("[V7.5 SPEECH] error:", exc)
+                set_interaction_state(state, "error", message[:48])
         finally:
             reply_queue.task_done()
 
@@ -7059,6 +8113,12 @@ def run_v7_5_queue():
     state = RobotRuntimeState(stop_event=stop_event)
     state.user_turn_queue = user_turn_queue
     state.reply_queue = reply_queue
+    try:
+        log_session = robot_memory.start_conversation_log_session()
+        state.conversation_log_session_id = log_session.get("session_id")
+        print(f"[V7.15 LOG] session={state.conversation_log_session_id} path={log_session.get('path')}")
+    except Exception as exc:
+        print("[V7.15 LOG] session start warning:", exc)
     _log_password_env_configured_once(state)
     set_interaction_state(state, "starting", "Miguel online")
     original_speak = install_speech_queue(reply_queue, safety, state)
@@ -7097,7 +8157,7 @@ def run_v7_5_queue():
             for thread in threads:
                 thread.start()
 
-            v6.speak("Miguel V7.5 queue core is online. Camera manager is active.")
+            v6.speak("I am Miguel, Marquinho's robot project. Camera and face recognition are online.")
             reply_queue.join()
             full.face_happy("Miguel online")
 
@@ -7118,6 +8178,7 @@ def run_v7_5_queue():
         print("[V7.5] Keyboard interrupt.")
 
     finally:
+        _append_log_event(state, "session_end", reason="shutdown")
         set_interaction_state(state, "shutdown_pending", "Stopping")
         stop_event.set()
         set_interaction_state(state, "sleeping", "Sleep")
