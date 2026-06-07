@@ -20,6 +20,7 @@ import shutil
 import sys
 import threading
 import time
+import unicodedata
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -203,6 +204,24 @@ class IdentityTracker:
 
 
 @dataclass
+class StorySession:
+    active: bool = False
+    mode: str = ""
+    subtype: str = "general"
+    language: str = "en"
+    title: str = ""
+    characters: list[str] = field(default_factory=list)
+    setting: str = ""
+    chapter_count: int = 0
+    current_chapter: int = 0
+    story_plan: list[str] = field(default_factory=list)
+    generated_chapters: dict[int, str] = field(default_factory=dict)
+    stop_requested: bool = False
+    target_words_per_chapter: int = 150
+    auto_continue: bool = False
+
+
+@dataclass
 class RobotRuntimeState:
     stop_event: threading.Event
     stop_speech_event: threading.Event = field(default_factory=threading.Event)
@@ -298,6 +317,7 @@ class RobotRuntimeState:
     long_story_target_minutes: int = 0
     long_story_style: str = ""
     recovered_story_context: str = ""
+    story_session: StorySession = field(default_factory=StorySession)
     last_prompt_type: str | None = None
     last_prompt_text: str | None = None
     last_joke_punchline: str | None = None
@@ -418,7 +438,7 @@ def _response_word_limit(mode: str) -> int:
     if mode == "story":
         return max(30, _env_int("MIGUEL_STORY_MAX_WORDS", 160))
     if mode == "long_story":
-        return max(120, _env_int("MIGUEL_LONG_STORY_MAX_WORDS", 250))
+        return _long_story_spoken_cap_words(True)
     return max(10, _env_int("MIGUEL_NORMAL_MAX_WORDS", 32))
 
 
@@ -460,18 +480,46 @@ NUMBER_WORDS = {
     "nineteen": 19,
     "twenty": 20,
     "thirty": 30,
+    "um": 1,
+    "uma": 1,
+    "dois": 2,
+    "duas": 2,
+    "tres": 3,
+    "três": 3,
+    "quatro": 4,
+    "cinco": 5,
+    "seis": 6,
+    "sete": 7,
+    "oito": 8,
+    "nove": 9,
+    "dez": 10,
+    "onze": 11,
+    "doze": 12,
+    "treze": 13,
+    "catorze": 14,
+    "quatorze": 14,
+    "quinze": 15,
+    "dezesseis": 16,
+    "dezasseis": 16,
+    "dezessete": 17,
+    "dezassete": 17,
+    "dezoito": 18,
+    "dezenove": 19,
+    "dezanove": 19,
+    "vinte": 20,
+    "trinta": 30,
 }
 
 
 def _extract_long_story_duration_minutes(text: str) -> int:
     normalized = normalize_command_text(text)
-    if not normalized or "minute" not in normalized:
+    if not normalized or not re.search(r"\b(?:minutes?|minutos?)\b", normalized):
         return 0
-    match = re.search(r"\b(\d{1,2})\s*(?:-| )?\s*minutes?\b", normalized)
+    match = re.search(r"\b(\d{1,2})\s*(?:-| )?\s*(?:minutes?|minutos?)\b", normalized)
     if match:
         minutes = int(match.group(1))
         return max(1, min(_long_story_max_target_minutes(), minutes))
-    match = re.search(r"\b([a-z]+)\s*(?:-| )?\s*minutes?\b", normalized)
+    match = re.search(r"\b([a-z]+)\s*(?:-| )?\s*(?:minutes?|minutos?)\b", normalized)
     if not match:
         return 0
     minutes = NUMBER_WORDS.get(match.group(1), 0)
@@ -485,6 +533,12 @@ def _long_story_target_words(minutes: int) -> int:
     if not minutes:
         return 0
     return max(120, minutes * _long_story_words_per_minute())
+
+
+def _long_story_spoken_cap_words(explicit_request: bool = True) -> int:
+    configured = _env_int("MIGUEL_LONG_STORY_MAX_WORDS", 250)
+    cap = min(250, max(180, configured))
+    return cap if explicit_request else min(cap, 180)
 
 
 def _format_long_story_duration(minutes: int) -> str:
@@ -1300,6 +1354,7 @@ LONG_STORY_ACTIVATION_PHRASES = {
     "long story mode",
     "go to long story mode",
     "story mode",
+    "modo historia",
     "tell longer stories",
     "make it a real long story",
     "make the story longer",
@@ -1307,6 +1362,14 @@ LONG_STORY_ACTIVATION_PHRASES = {
     "tell the full story",
     "tell a longer story",
     "continue as a long story",
+    "historia longa",
+    "conte uma historia",
+    "contar uma historia",
+    "uma historia de cinco minutos",
+    "de cinco minutos",
+    "historia comprida",
+    "historia maior",
+    "longa historia",
 }
 
 NORMAL_DEPTH_PHRASES = {
@@ -1323,12 +1386,423 @@ NORMAL_DEPTH_PHRASES = {
 
 LONG_EXPLANATION_ACTIVATION_PHRASES = {
     "long explanation mode",
+    "activate long explanation mode",
+    "turn on long explanation mode",
+    "turn on detailed mode",
+    "use longer answers from now on",
     "tell me a long explanation",
     "explain more",
     "give me the long version",
     "more details",
     "detailed mode",
 }
+
+
+PORTUGUESE_LONG_STORY_TRIGGERS = [
+    ("historia longa", "história longa"),
+    ("conte uma historia", "conte uma história"),
+    ("conta uma historia", "conta uma história"),
+    ("contar uma historia", "contar uma história"),
+    ("quero uma historia", "quero uma história"),
+    ("uma historia de cinco minutos", "uma história de cinco minutos"),
+    ("uma historia de dez minutos", "uma história de dez minutos"),
+    ("de cinco minutos", "de cinco minutos"),
+    ("de dez minutos", "de dez minutos"),
+    ("historia comprida", "história comprida"),
+    ("historia maior", "história maior"),
+    ("longa historia", "longa história"),
+    ("modo historia", "modo história"),
+    ("historia para dormir", "história para dormir"),
+    ("historia de dormir", "história de dormir"),
+    ("coloca o marquinho para dormir com uma historia", "coloca o Marquinho para dormir com uma história"),
+    ("faz o marquinho dormir com uma historia", "faz o Marquinho dormir com uma história"),
+]
+
+ENGLISH_LONG_STORY_TRIGGERS = [
+    ("long story", "long story"),
+    ("tell me a story", "tell me a story"),
+    ("tell a story", "tell a story"),
+    ("story mode", "story mode"),
+    ("bedtime story", "bedtime story"),
+    ("sleep story", "sleep story"),
+    ("five minute story", "five minute story"),
+    ("five minutes story", "five minute story"),
+    ("ten minute story", "ten minute story"),
+    ("10 minute story", "10 minute story"),
+    ("long explanation", "long explanation"),
+]
+
+STORY_WORDS = {"story", "historia"}
+STORY_GENERATION_TRIGGERS = {
+    "tell a story",
+    "tell me a story",
+    "make a story",
+    "create a story",
+    "invent a story",
+    "new story",
+    "another story",
+    "different story",
+    "start a new story",
+    "conte uma historia",
+    "conta uma historia",
+    "contar uma historia",
+    "quero uma historia",
+    "crie uma historia",
+    "criar uma historia",
+    "invente uma historia",
+    "inventar uma historia",
+    "nova historia",
+    "outra historia",
+    "historia diferente",
+}
+
+BEDTIME_STORY_MARKERS = {
+    "bedtime story",
+    "sleep story",
+    "story to sleep",
+    "to sleep with a story",
+    "put marquinho to sleep with a story",
+    "tell marquinho a story to sleep",
+    "historia para dormir",
+    "historia de dormir",
+    "para o marquinho dormir",
+    "para dormir",
+    "coloca o marquinho para dormir com uma historia",
+    "faz o marquinho dormir com uma historia",
+}
+
+
+def _contains_story_word(normalized: str) -> bool:
+    words = set(str(normalized or "").split())
+    return bool(words & STORY_WORDS)
+
+
+def _has_story_request_marker(normalized: str) -> bool:
+    normalized = str(normalized or "")
+    if not normalized:
+        return False
+    request_markers = STORY_GENERATION_TRIGGERS | {
+        "tell me a long story",
+        "tell a long story",
+        "long story about",
+        "conte uma historia longa",
+        "conta uma historia longa",
+        "contar uma historia longa",
+        "quero uma historia",
+        "historia longa sobre",
+        "longa historia sobre",
+        "historia para dormir",
+        "historia de dormir",
+        "bedtime story",
+        "sleep story",
+        "put marquinho to sleep with a story",
+        "tell marquinho a story to sleep",
+    }
+    return any(marker in normalized for marker in request_markers) or bool(
+        re.search(r"\b(?:tell me|tell|give me)\b.+\bstory\b", normalized)
+    )
+
+
+def _story_subtype(normalized: str) -> str:
+    if any(marker in str(normalized or "") for marker in BEDTIME_STORY_MARKERS):
+        return "bedtime"
+    if any(marker in str(normalized or "") for marker in {"adventure", "aventura", "aventuras"}):
+        return "adventure"
+    return "general"
+
+
+def _story_chapter_count(requested_minutes: int, subtype: str) -> int:
+    if subtype == "bedtime":
+        return 5
+    if requested_minutes >= 10:
+        return 5
+    if requested_minutes >= 5:
+        return 3
+    return 1
+
+
+def _story_mode_for_intent(requested_minutes: int, subtype: str) -> str:
+    if requested_minutes >= 5 or subtype == "bedtime":
+        return "story_continuous"
+    return "story_long_single"
+
+
+def _empty_story_detection() -> dict:
+    return {
+        "detected": False,
+        "language": None,
+        "response_language": "",
+        "trigger": "",
+        "mode": "normal",
+        "action": "none",
+        "story_mode": "",
+        "subtype": "general",
+        "requested_minutes": 0,
+        "chapter_count": 0,
+        "target_words_per_chapter": 150,
+        "auto_continue": False,
+        "has_story_request": False,
+        "classifier_used": False,
+        "low_confidence": False,
+        "confidence": 0.0,
+    }
+
+
+def _story_detection_payload(
+    language: str,
+    trigger: str,
+    mode: str,
+    normalized: str,
+    text: str,
+    response_language: str | None = None,
+    characters: list[str] | None = None,
+    setting: str | None = None,
+    confidence: float = 1.0,
+) -> dict:
+    requested_minutes = _extract_long_story_duration_minutes(text)
+    subtype = _story_subtype(normalized)
+    has_story_request = _has_story_request_marker(normalized)
+    story_mode = _story_mode_for_intent(requested_minutes, subtype) if mode == "long_story" else ""
+    chapter_count = _story_chapter_count(requested_minutes, subtype) if story_mode == "story_continuous" else 1
+    return {
+        "detected": True,
+        "language": language,
+        "response_language": response_language or language,
+        "trigger": trigger,
+        "mode": mode,
+        "action": "generate_story" if mode == "long_story" and has_story_request else "mode_setting",
+        "story_mode": story_mode,
+        "subtype": subtype,
+        "requested_minutes": requested_minutes,
+        "chapter_count": chapter_count,
+        "target_words_per_chapter": 150 if story_mode == "story_continuous" else 250,
+        "auto_continue": story_mode == "story_continuous",
+        "has_story_request": has_story_request,
+        "characters": characters or [],
+        "setting": setting or "",
+        "confidence": float(confidence),
+    }
+
+
+STORY_INTENT_CACHE: dict[str, dict] = {}
+SUPPORTED_STORY_LANGUAGES = {"en", "pt", "fr", "es", "it", "de", "unknown"}
+
+
+def _coerce_intent_minutes(value) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _mode_from_classifier_minutes(mode: str, requested_minutes: int, subtype: str) -> str:
+    if mode in {"story_short", "story_long_single", "story_continuous"}:
+        if mode == "story_short":
+            return "story_long_single"
+        return mode
+    return _story_mode_for_intent(requested_minutes, subtype)
+
+
+def _normalize_multilingual_classifier_result(raw: dict, text: str) -> dict:
+    if not isinstance(raw, dict):
+        return _empty_story_detection()
+    intent = str(raw.get("intent") or "normal_conversation").strip().lower()
+    action = str(raw.get("action") or "answer").strip().lower()
+    language = str(raw.get("language") or "unknown").strip().lower()
+    if language not in SUPPORTED_STORY_LANGUAGES:
+        language = "unknown"
+    response_language = str(raw.get("response_language") or language or "unknown").strip().lower()
+    subtype = str(raw.get("subtype") or "general").strip().lower()
+    if subtype not in {"general", "bedtime", "adventure"}:
+        subtype = "general"
+    try:
+        confidence = float(raw.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if confidence < 0.65:
+        result = _empty_story_detection()
+        result.update({
+            "language": language,
+            "response_language": response_language,
+            "classifier_used": True,
+            "low_confidence": True,
+            "confidence": confidence,
+        })
+        return result
+    if intent == "stop_story" or action == "stop":
+        result = _empty_story_detection()
+        result.update({
+            "detected": True,
+            "language": language,
+            "response_language": response_language,
+            "intent": "stop_story",
+            "action": "stop",
+            "confidence": confidence,
+        })
+        return result
+    if intent != "story" or action != "generate_story":
+        result = _empty_story_detection()
+        result.update({
+            "detected": intent == "mode_setting",
+            "language": language,
+            "response_language": response_language,
+            "intent": intent,
+            "action": "mode_setting" if intent == "mode_setting" else "answer",
+            "confidence": confidence,
+        })
+        return result
+
+    requested_minutes = _coerce_intent_minutes(raw.get("requested_minutes"))
+    story_mode = _mode_from_classifier_minutes(str(raw.get("mode") or ""), requested_minutes, subtype)
+    chapter_count = _story_chapter_count(requested_minutes, subtype) if story_mode == "story_continuous" else 1
+    result = {
+        "detected": True,
+        "language": language,
+        "response_language": response_language,
+        "trigger": "multilingual_classifier",
+        "mode": "long_story",
+        "action": "generate_story",
+        "story_mode": story_mode,
+        "subtype": subtype,
+        "requested_minutes": requested_minutes,
+        "chapter_count": chapter_count,
+        "target_words_per_chapter": 150 if story_mode == "story_continuous" else 250,
+        "auto_continue": story_mode == "story_continuous",
+        "has_story_request": True,
+        "characters": list(raw.get("characters") or []),
+        "setting": str(raw.get("setting") or ""),
+        "confidence": confidence,
+        "intent": "story",
+        "classifier_used": True,
+    }
+    return result
+
+
+def _classify_story_intent_multilingual(text: str) -> dict:
+    instructions = (
+        "Classify Miguel robot user transcripts for story intent. "
+        "Return structured JSON only with this schema: "
+        "{\"intent\":\"story|mode_setting|normal_conversation|stop_story\","
+        "\"action\":\"generate_story|set_mode|answer|stop\","
+        "\"language\":\"en|pt|fr|es|it|de|unknown\","
+        "\"response_language\":\"string\","
+        "\"mode\":\"story_short|story_long_single|story_continuous|null\","
+        "\"subtype\":\"general|bedtime|adventure|null\","
+        "\"requested_minutes\":0,"
+        "\"characters\":[],\"setting\":null,\"confidence\":0.0}. "
+        "Recognize story requests in any language, including French raconte-moi une longue histoire, "
+        "French histoire de dix minutes, French histoire pour dormir, Spanish cuéntame una historia larga, "
+        "Spanish cuento para dormir, Italian/German equivalents, and stop-story commands. "
+        "Duration or bedtime story requests should use mode story_continuous. "
+        "Do not classify story requests as long explanation mode."
+    )
+    response = v6.client.responses.create(
+        model=getattr(v6, "OPENAI_MODEL", "gpt-4o-mini"),
+        instructions=instructions,
+        input=str(text or ""),
+    )
+    output = str(getattr(response, "output_text", "") or "").strip()
+    output = re.sub(r"^```(?:json)?\s*|\s*```$", "", output, flags=re.IGNORECASE | re.DOTALL).strip()
+    return json.loads(output)
+
+
+def _multilingual_story_mode_detection(text: str, normalized: str) -> dict:
+    key = str(normalized or normalize_command_text(text))
+    if not key:
+        return _empty_story_detection()
+    if key in STORY_INTENT_CACHE:
+        return dict(STORY_INTENT_CACHE[key])
+    try:
+        raw = _classify_story_intent_multilingual(text)
+        result = _normalize_multilingual_classifier_result(raw, text)
+        if result.get("classifier_used"):
+            print(
+                "[V7.15 MULTILINGUAL INTENT] "
+                f"used=true language={result.get('language')} intent=story "
+                f"confidence={float(result.get('confidence') or 0.0):.2f}"
+            )
+        STORY_INTENT_CACHE[key] = dict(result)
+        return result
+    except Exception as exc:
+        print("[V7.15 MULTILINGUAL INTENT] used=false warning=", exc)
+        result = _empty_story_detection()
+        STORY_INTENT_CACHE[key] = dict(result)
+        return result
+
+
+def _story_mode_detection(text: str) -> dict:
+    normalized = normalize_command_text(text)
+    if not normalized:
+        return _empty_story_detection()
+
+    for trigger, display in PORTUGUESE_LONG_STORY_TRIGGERS:
+        if trigger in normalized:
+            return _story_detection_payload("pt", display, "long_story", normalized, text)
+
+    for trigger, display in ENGLISH_LONG_STORY_TRIGGERS:
+        if trigger in normalized:
+            mode = "long_story" if "explanation" not in trigger else "long_explanation"
+            return _story_detection_payload("en", display, mode, normalized, text)
+
+    duration_minutes = _extract_long_story_duration_minutes(text)
+    if duration_minutes and _contains_story_word(normalized):
+        language = "pt" if "historia" in normalized else "en"
+        trigger = "minutos" if language == "pt" else "minutes"
+        return _story_detection_payload(language, trigger, "long_story", normalized, text)
+
+    return _multilingual_story_mode_detection(text, normalized)
+
+
+def _is_long_story_request_text(text: str) -> bool:
+    return _story_mode_detection(text).get("mode") == "long_story"
+
+
+def _log_story_mode_detection(detection: dict) -> None:
+    if detection.get("detected"):
+        print(
+            "[V7.15 STORY INTENT] "
+            f"detected=true language={detection.get('language')} "
+            f"action={detection.get('action')} mode={detection.get('story_mode') or detection.get('mode')} "
+            f"trigger=\"{detection.get('trigger')}\""
+        )
+        minutes = int(detection.get("requested_minutes") or 0)
+        if detection.get("story_mode") == "story_continuous":
+            print(
+                "[V7.15 STORY INTENT] "
+                f"detected=true language={detection.get('language')} "
+                f"mode=story_continuous requested_minutes={minutes}"
+            )
+
+
+def _log_story_execution_generate() -> None:
+    print("[V7.15 STORY EXECUTION] action=generate_story route=story depth=long_story skipped_legacy_long_mode=true")
+
+
+def _log_story_execution_skip_legacy(reason: str = "story_request") -> None:
+    print(f"[V7.15 STORY EXECUTION] skipped_legacy_long_mode=true reason={reason}")
+
+
+def _route_low_confidence_story_intent(detection: dict, state: RobotRuntimeState) -> bool:
+    if not detection.get("low_confidence"):
+        return False
+    language = str(detection.get("response_language") or detection.get("language") or "").lower()
+    if language == "pt":
+        reply = "Eu ouvi você, mas não tenho certeza se quer uma história. Pode repetir em uma frase curta?"
+    elif language == "fr":
+        reply = "Je vous ai entendu, mais je ne suis pas sûr que vous vouliez une histoire. Pouvez-vous répéter brièvement?"
+    elif language == "es":
+        reply = "Te escuché, pero no estoy seguro de si quieres una historia. ¿Puedes repetirlo brevemente?"
+    else:
+        reply = "I heard you, but I am not sure if you want a story. Please say that again briefly."
+    _set_reply_context(state, "clarification")
+    _set_response_length_context(state, "terse")
+    print(
+        "[V7.15 STORY INTENT] "
+        f"low_confidence=true language={detection.get('language')} "
+        f"confidence={float(detection.get('confidence') or 0.0):.2f} action=clarify"
+    )
+    v6.speak(reply)
+    return True
 
 
 def _is_depth_status_question(text: str) -> bool:
@@ -1377,7 +1851,9 @@ def _is_explicit_long_story_request(text: str) -> bool:
     normalized = normalize_command_text(text)
     if not normalized:
         return False
-    if _extract_long_story_duration_minutes(text) and "story" in normalized:
+    if _is_long_story_request_text(text):
+        return True
+    if _extract_long_story_duration_minutes(text) and _contains_story_word(normalized):
         return True
     markers = {
         "long story",
@@ -1394,6 +1870,8 @@ def _is_explicit_long_story_request(text: str) -> bool:
 def _long_story_depth_applies_to_route(route: str, last_user_text: str, conversation_mode: str) -> bool:
     normalized = normalize_command_text(last_user_text)
     if route in {"creative", "story"}:
+        return True
+    if _is_long_story_request_text(last_user_text):
         return True
     if conversation_mode in {"creative", "story"} and route == "normal" and (
         _is_contextual_followup(normalized) or _is_story_continue_text(normalized)
@@ -1623,6 +2101,8 @@ def _wait_until_listening_allowed(state: RobotRuntimeState) -> None:
 
 def _normalize_for_echo(text: str) -> str:
     t = str(text or "").lower()
+    t = unicodedata.normalize("NFKD", t)
+    t = "".join(char for char in t if not unicodedata.combining(char))
     t = re.sub(r"[^a-z0-9\s]", " ", t)
     return re.sub(r"\s+", " ", t).strip()
 
@@ -2057,7 +2537,7 @@ def make_robot_reply_concise(
     depth = str(response_depth_mode or "normal").strip().lower()
     if mode not in {"terse", "normal", "detailed", "story", "long_story"}:
         mode = "normal"
-    if depth == "long_story" and context in {"creative", "story"}:
+    if depth == "long_story" and context in {"creative", "story", "normal"}:
         mode = "long_story"
     elif depth == "long_explanation" and context not in TERSE_ALLOWED_ROUTES:
         mode = "detailed"
@@ -2107,7 +2587,13 @@ def make_robot_reply_concise(
     else:
         shaped = trim_to_word_limit_preserve_sentence(original, limit)
     if _word_len(shaped) < words_before:
-        print(f"[V7.14 LENGTH] trimmed mode={mode} words_before={words_before} words_after={_word_len(shaped)}")
+        if mode == "long_story":
+            print(
+                f"[V7.15 LENGTH] mode=long_story words_before={words_before} "
+                f"words_after={_word_len(shaped)} trim_policy=story_cap"
+            )
+        else:
+            print(f"[V7.14 LENGTH] trimmed mode={mode} words_before={words_before} words_after={_word_len(shaped)}")
     return shaped
 
 
@@ -2646,6 +3132,8 @@ def _infer_conversation_mode(text: str, camera_intent: str = "none") -> str:
     }
     if any(marker in normalized for marker in conversation_markers):
         return "story" if "story mode" in normalized else "general"
+    if _is_long_story_request_text(text):
+        return "story"
     if any(
         phrase in normalized
         for phrase in {
@@ -2683,6 +3171,14 @@ def _infer_conversation_mode(text: str, camera_intent: str = "none") -> str:
             "another story",
             "change the story",
             "continue the story",
+            "modo historia",
+            "conte uma historia",
+            "contar uma historia",
+            "crie uma historia",
+            "inventar uma historia",
+            "nova historia",
+            "outra historia",
+            "continua a historia",
             "narrate",
         }
     ):
@@ -2703,7 +3199,7 @@ def _infer_conversation_mode(text: str, camera_intent: str = "none") -> str:
     if _is_mode_command_not_physical(normalized):
         if "creative mode" in normalized or normalized == "go creative":
             return "creative"
-        if "long story mode" in normalized:
+        if "long story mode" in normalized or "modo historia" in normalized:
             return "story"
         if "robot project" in normalized or "project mode" in normalized:
             return "project"
@@ -2779,10 +3275,15 @@ CORRECTION_RETRY_MARKERS = {
     "no, i mean",
     "that s not it",
     "thats not it",
+    "nao e isso",
+    "nao eh isso",
+    "nao era isso",
+    "tem que ser",
     "that s not the skeleton",
     "thats not the skeleton",
     "try again",
     "wrong",
+    "faz maior",
 }
 
 
@@ -2866,6 +3367,9 @@ STORY_CONTINUATION_PHRASES = {
     "continue",
     "continue story",
     "continue the story",
+    "continua",
+    "continua a historia",
+    "continua historia",
     "keep going",
     "keep it going",
     "keep it going miguel",
@@ -2886,6 +3390,8 @@ def _is_story_continue_text(text: str) -> bool:
             "continua",
             "continue miguel",
             "continua miguel",
+            "continua a historia",
+            "continua historia",
             "continue the story",
             "keep going",
             "keep it going",
@@ -2898,26 +3404,16 @@ def _is_story_continue_text(text: str) -> bool:
 
 def _is_new_story_request(text: str) -> bool:
     normalized = normalize_command_text(text)
-    if not normalized or "story" not in normalized:
+    if not normalized:
+        return False
+    story_detection = _story_mode_detection(text)
+    if story_detection.get("mode") == "long_story" and story_detection.get("action") == "generate_story":
+        return True
+    if not _contains_story_word(normalized):
         return False
     if _extract_long_story_duration_minutes(text) and not _is_mode_command_not_physical(normalized):
         return True
-    return any(
-        marker in normalized
-        for marker in {
-            "new story",
-            "another story",
-            "different story",
-            "change the story",
-            "change story",
-            "start a new story",
-            "make a story",
-            "create a story",
-            "invent a story",
-            "tell me a story",
-            "tell a story",
-        }
-    )
+    return any(marker in normalized for marker in STORY_GENERATION_TRIGGERS | {"change the story", "change story"})
 
 
 def _extract_story_theme(text: str) -> str:
@@ -2953,6 +3449,11 @@ def _clean_story_topic(topic: str) -> str:
         topic,
     )
     topic = re.sub(
+        r"\b(?:de|por)?\s*(?:um|uma|dois|duas|tres|três|quatro|cinco|seis|sete|oito|nove|dez|onze|doze|treze|catorze|quatorze|quinze|dezesseis|dezasseis|dezessete|dezassete|dezoito|dezenove|dezanove|vinte|trinta)\s*(?:-| )?\s*minutos?\b",
+        " ",
+        topic,
+    )
+    topic = re.sub(
         r"\b(?:please|yeah|miguel|now|can you|could you|would you|creative mode|long story mode|story mode|long mode|go to|switch to|set|make it|make this|tell a story|tell me a story|for me)\b",
         " ",
         topic,
@@ -2962,7 +3463,10 @@ def _clean_story_topic(topic: str) -> str:
     topic = re.sub(r"\b(?:style|tone|genre)\s+is\s+[a-z ]{2,40}$", " ", topic)
     topic = re.sub(r"\b(?:in|with)\s+(?:a\s+)?[a-z ]{2,30}\s+(?:style|tone|genre)\b", " ", topic)
     topic = re.sub(r"\b(?:and\s+)?tell\s+(?:us|me)?\s*(?:a\s+)?(?:long\s+)?story\s*(?:about|on)?\s*", " ", topic)
+    topic = re.sub(r"\b(?:e\s+)?(?:conte|contar|crie|criar|invente|inventar)\s+(?:uma\s+)?(?:historia\s+)?(?:longa|comprida|maior)?\s*(?:sobre)?\s*", " ", topic)
+    topic = re.sub(r"\b(?:historia\s+longa|longa\s+historia|historia\s+comprida|historia\s+maior|modo\s+historia)\b", " ", topic)
     topic = re.sub(r"\b(?:and\s+)?a\s+(?:story|about)\b", " ", topic)
+    topic = re.sub(r"\b(?:uma\s+)?historia\s+(?:sobre|de)?\b", " ", topic)
     topic = re.sub(r"^(?:about|around|with|on)\s+", "", topic.strip())
     topic = re.sub(r"\s+", " ", topic).strip(" .,:;!?")
     return "" if topic in {"your", "you", "me", "this", "that"} else topic
@@ -3079,6 +3583,12 @@ def _should_recover_story_context(text: str) -> bool:
             "yesterday story",
             "previous story",
             "last story",
+            "continua a historia",
+            "continua historia",
+            "continua a historia anterior",
+            "volta para a historia",
+            "historia anterior",
+            "ultima historia",
         })
     )
 
@@ -3103,7 +3613,12 @@ def _recover_story_context_from_logs(user_text: str, state: RobotRuntimeState, m
             user = str(event.get("user_text") or "").strip()
             assistant = str(event.get("assistant_reply") or "").strip()
             combined = normalize_command_text(user + " " + assistant)
-            if "story" not in topic and "story" not in combined and "chapter" not in combined:
+            if (
+                not _contains_story_word(topic)
+                and not _contains_story_word(combined)
+                and "chapter" not in combined
+                and "capitulo" not in combined
+            ):
                 continue
             snippets.append(
                 f"{metadata.get('session_id')}: user={_safe_memory_snippet(user, 160)} reply={_safe_memory_snippet(assistant, 260)}"
@@ -3574,10 +4089,16 @@ def _is_mode_command_not_physical(text: str) -> bool:
         "go to creative mode",
         "go to long story mode",
         "go to long explanation mode",
+        "activate long explanation mode",
+        "turn on long explanation mode",
+        "turn on detailed mode",
+        "use longer answers from now on",
         "go to normal mode",
         "switch to creative mode",
         "switch back to robot project",
         "switch to project mode",
+        "entra em modo historia",
+        "entrar em modo historia",
         "keep creative mode",
         "stay in creative mode",
         "normal mode",
@@ -3609,6 +4130,7 @@ def _is_mode_command_not_physical(text: str) -> bool:
     mode_markers = {
         "creative mode",
         "long story mode",
+        "modo historia",
         "long explanation mode",
         "normal mode",
         "robot project",
@@ -3618,6 +4140,11 @@ def _is_mode_command_not_physical(text: str) -> bool:
         "go to",
         "switch to",
         "switch back to",
+        "activate",
+        "turn on",
+        "use",
+        "entra em",
+        "entrar em",
         "keep",
         "stay in",
         "go creative",
@@ -3688,7 +4215,10 @@ def _is_correction_retry_text(text: str) -> bool:
 
 def infer_response_length_mode(text: str, conversation_mode: str = "general", camera_intent: str = "none") -> str:
     normalized = normalize_command_text(text)
-    if _extract_long_story_duration_minutes(text) and "story" in normalized:
+    story_detection = _story_mode_detection(text)
+    if story_detection.get("mode") == "long_story" and story_detection.get("action") == "generate_story":
+        return "long_story"
+    if _extract_long_story_duration_minutes(text) and _contains_story_word(normalized):
         return "long_story"
     if _is_explicit_long_story_request(text) or any(
         phrase in normalized
@@ -3702,7 +4232,7 @@ def infer_response_length_mode(text: str, conversation_mode: str = "general", ca
             "teach me this topic",
         }
     ):
-        return "long_story" if "story" in normalized else "detailed"
+        return "long_story" if _contains_story_word(normalized) else "detailed"
     if any(
         phrase in normalized
         for phrase in {
@@ -3729,7 +4259,7 @@ def infer_response_length_mode(text: str, conversation_mode: str = "general", ca
         if any(phrase in normalized for phrase in {"tell me more", "full answer", "give me the full answer"}):
             return "detailed"
         return "normal"
-    if conversation_mode == "story" or any(phrase in normalized for phrase in {"story mode", "tell me a story", "continue the story"}):
+    if conversation_mode == "story" or any(phrase in normalized for phrase in {"story mode", "modo historia", "tell me a story", "conte uma historia", "continue the story", "continua a historia"}):
         return "story"
     if any(
         phrase in normalized
@@ -3785,7 +4315,7 @@ def _response_length_instruction(mode: str) -> str:
     if mode == "story":
         return "Answer as one short story segment, about 80 to 120 words."
     if mode == "long_story":
-        return "Answer as a real longer story, about 120 to 250 spoken words, ending cleanly."
+        return "Answer as a real longer story, about 180 to 250 spoken words in 2 to 4 short spoken paragraphs, ending cleanly."
     return "Answer in 2 to 5 short sentences."
 
 
@@ -3822,10 +4352,10 @@ def _with_cloud_reply_instructions(
         topic_line = f" Current creative topic: {active_topic}." if active_topic else ""
         duration_line = ""
         if long_story_target_minutes:
-            target_words = _long_story_target_words(long_story_target_minutes)
+            target_words = _long_story_spoken_cap_words(True)
             duration_line = (
-                f" Aim for about {_format_long_story_duration(long_story_target_minutes)} of uninterrupted spoken story, "
-                f"around {target_words} words if the model can fit it. This overrides any shorter long-story word count."
+                f" The user asked for about {_format_long_story_duration(long_story_target_minutes)}; treat that as a request for a rich story, "
+                f"but keep this spoken segment around 180 to {target_words} words for voice usability."
             )
         style_line = f" Requested story style: {story_style}." if story_style else ""
         recovered_line = (
@@ -3834,7 +4364,7 @@ def _with_cloud_reply_instructions(
             else ""
         )
         paragraph_instruction = (
-            "Use multiple spoken paragraphs"
+            "Use 2 to 4 short spoken paragraphs"
             if long_story_target_minutes
             else "Answer in 2 to 4 short spoken paragraphs"
         )
@@ -4013,9 +4543,13 @@ V715_SHORT_FOLLOWUP_PHRASES = {
     "cool",
     "interesting",
     "continue",
+    "continua",
     "keep going",
     "tell me more",
     "make it longer",
+    "faz maior",
+    "nao e isso",
+    "tem que ser",
     "that was good",
     "switch back to robot project",
     "robot project",
@@ -4041,6 +4575,10 @@ def _is_v715_short_followup_text(text: str) -> bool:
             "still creative mode",
             "tell me more",
             "make it longer",
+            "continua",
+            "faz maior",
+            "nao e isso",
+            "tem que ser",
         }
     )
 
@@ -4722,6 +5260,7 @@ def _route_response_depth_mode(user_text: str, state: RobotRuntimeState) -> bool
     normalized = normalize_command_text(user_text)
     if not normalized:
         return False
+    story_detection = _story_mode_detection(user_text)
     target_minutes = _extract_long_story_duration_minutes(user_text)
     topic_hint = _extract_long_story_topic_hint(user_text)
     story_style = _extract_story_style(user_text)
@@ -4737,8 +5276,13 @@ def _route_response_depth_mode(user_text: str, state: RobotRuntimeState) -> bool
     if _is_new_story_request(user_text) and normalized not in LONG_STORY_ACTIVATION_PHRASES:
         return False
 
+    if story_detection.get("mode") == "long_story" and story_detection.get("has_story_request"):
+        _log_story_execution_skip_legacy("story_request")
+        return False
+
     if _is_mode_command_not_physical(normalized):
-        if any(marker in normalized for marker in {"long story mode"}):
+        if any(marker in normalized for marker in {"long story mode", "modo historia"}) or story_detection.get("mode") == "long_story":
+            _log_story_mode_detection(story_detection)
             _set_response_depth_mode(state, "long_story", "mode_command")
             _set_response_length_context(state, "long_story")
             with state.lock:
@@ -4779,6 +5323,7 @@ def _route_response_depth_mode(user_text: str, state: RobotRuntimeState) -> bool
         return True
 
     if normalized in LONG_STORY_ACTIVATION_PHRASES:
+        _log_story_mode_detection(story_detection)
         _set_response_depth_mode(state, "long_story", normalized.replace(" ", "_"))
         _set_response_length_context(state, "long_story")
         with state.lock:
@@ -5159,22 +5704,31 @@ def _extract_long_story_topic(user_text: str) -> str:
     for phrase in (
         "tell me a long story",
         "tell me a bedtime story",
+        "conte uma historia longa",
+        "conte uma historia",
+        "conta uma historia longa",
+        "conta uma historia",
+        "contar uma historia",
+        "historia longa",
+        "longa historia",
         "tell me a long explanation",
         "explain in detail for a long time",
         "give me the full explanation",
         "teach me this topic",
         "long story mode",
+        "modo historia",
     ):
         if normalized.startswith(phrase):
             topic = normalized[len(phrase):].strip()
-            return topic or ("bedtime story" if "story" in phrase else "this topic")
+            return topic or ("bedtime story" if "story" in phrase or "historia" in phrase else "this topic")
     return normalized or "this topic"
 
 
 def _is_long_mode_request(text: str) -> bool:
     normalized = normalize_command_text(text)
     return (
-        (_extract_long_story_duration_minutes(text) > 0 and "story" in normalized)
+        (_extract_long_story_duration_minutes(text) > 0 and _contains_story_word(normalized))
+        or _is_long_story_request_text(text)
         or normalized in LONG_STORY_ACTIVATION_PHRASES
         or any(
             phrase in normalized
@@ -5192,38 +5746,465 @@ def _is_long_mode_request(text: str) -> bool:
 
 def _is_long_mode_continue(text: str) -> bool:
     normalized = normalize_command_text(text)
-    return normalized in {"continue", "next part", "keep going", "go on", "continue the story"}
+    return normalized in {"continue", "continua", "next part", "keep going", "go on", "continue the story", "continua a historia", "continua historia"}
 
 
 def _is_story_generation_request(text: str) -> bool:
     normalized = normalize_command_text(text)
-    if not normalized or "story" not in normalized:
+    if not normalized:
+        return False
+    story_detection = _story_mode_detection(text)
+    if story_detection.get("mode") == "long_story" and story_detection.get("action") == "generate_story":
+        return True
+    if not _contains_story_word(normalized):
         return False
     if _is_mode_command_not_physical(normalized) and not any(
         phrase in normalized
-        for phrase in {
-            "tell a story",
-            "tell me a story",
-            "make a story",
-            "create a story",
-            "invent a story",
-        }
+        for phrase in STORY_GENERATION_TRIGGERS
     ):
         return False
     return any(
         phrase in normalized
-        for phrase in {
-            "tell a story",
-            "tell me a story",
-            "make a story",
-            "create a story",
-            "invent a story",
-            "new story",
-            "another story",
-            "different story",
-            "start a new story",
-        }
+        for phrase in STORY_GENERATION_TRIGGERS
     ) or (_extract_long_story_duration_minutes(text) > 0 and not _is_mode_command_not_physical(normalized))
+
+
+def _is_story_stop_request(text: str) -> bool:
+    normalized = normalize_command_text(text)
+    if not normalized:
+        return False
+    return any(
+        marker in normalized
+        for marker in {
+            "parar historia",
+            "para a historia",
+            "cancelar historia",
+            "chega",
+            "dormir",
+            "stop story",
+            "cancel story",
+            "enough",
+            "go to sleep",
+        }
+    )
+
+
+def _story_title_from_topic(topic: str, language: str, subtype: str) -> str:
+    topic = _clean_story_topic(topic)
+    if language == "fr":
+        if subtype == "bedtime":
+            return "La Nuit Calme de Marquinho"
+        return topic[:70].title() if topic and topic != "this story" else "La Grande Aventure"
+    if language == "es":
+        if subtype == "bedtime":
+            return "La Noche Tranquila de Marquinho"
+        return topic[:70].title() if topic and topic != "this story" else "La Gran Aventura"
+    if language == "it":
+        if subtype == "bedtime":
+            return "La Notte Tranquilla di Marquinho"
+        return topic[:70].title() if topic and topic != "this story" else "La Grande Avventura"
+    if language == "de":
+        if subtype == "bedtime":
+            return "Marquinhos Ruhige Nacht"
+        return topic[:70].title() if topic and topic != "this story" else "Das Grosse Abenteuer"
+    if subtype == "bedtime":
+        return "A Noite Calma de Marquinho" if language == "pt" else "Marquinho's Quiet Night"
+    if topic and topic != "this story":
+        return topic[:70].title()
+    return "A Grande Aventura" if language == "pt" else "The Big Adventure"
+
+
+def _story_characters_from_text(text: str) -> list[str]:
+    normalized = normalize_command_text(text)
+    names = []
+    for candidate in ("marquinho", "helena", "marco", "miguel"):
+        if candidate in normalized and candidate.title() not in names:
+            names.append(candidate.title())
+    return names or ["Marquinho", "Helena"]
+
+
+def _story_setting_from_text(text: str, language: str) -> str:
+    normalized = normalize_command_text(text)
+    if "brasilia" in normalized:
+        return "Brasília"
+    if "cidade" in normalized:
+        return "uma cidade tranquila" if language == "pt" else "a quiet city"
+    if language == "fr":
+        return "un lieu plein d'imagination"
+    if language == "es":
+        return "un lugar lleno de imaginación"
+    if language == "it":
+        return "un luogo pieno di immaginazione"
+    if language == "de":
+        return "ein Ort voller Fantasie"
+    return "um lugar cheio de imaginação" if language == "pt" else "an imaginative place"
+
+
+def _build_story_plan(title: str, chapter_count: int, language: str, subtype: str) -> list[str]:
+    if language == "pt":
+        if subtype == "bedtime":
+            base = [
+                "Chegada calma e apresentação dos personagens.",
+                "Uma pequena descoberta gentil, sem sustos.",
+                "Um passeio sereno que resolve uma preocupação.",
+                "Os personagens ajudam uns aos outros e desaceleram.",
+                "Final aconchegante, com todos seguros e prontos para dormir.",
+            ]
+        else:
+            base = [
+                "Começo da aventura e apresentação do desejo dos personagens.",
+                "A descoberta de um problema curioso.",
+                "Uma tentativa criativa que quase funciona.",
+                "A solução corajosa e colaborativa.",
+                "Final completo, com volta para casa e aprendizado.",
+            ]
+    elif language == "fr":
+        if subtype == "bedtime":
+            base = [
+                "Arrivée calme et présentation douce des personnages.",
+                "Une petite découverte paisible, sans peur.",
+                "Une promenade tranquille qui résout une inquiétude.",
+                "Les personnages s'aident et ralentissent ensemble.",
+                "Fin rassurante, tout le monde est en sécurité et prêt à dormir.",
+            ]
+        else:
+            base = [
+                "Début de l'aventure et présentation du souhait des personnages.",
+                "Un problème curieux apparaît.",
+                "Une idée créative fonctionne presque.",
+                "Une solution courageuse et collective réussit.",
+                "Fin complète, retour à la maison et petite leçon.",
+            ]
+    elif language == "es":
+        if subtype == "bedtime":
+            base = [
+                "Llegada tranquila y presentación suave de los personajes.",
+                "Un pequeño descubrimiento pacífico, sin sustos.",
+                "Un paseo sereno que resuelve una preocupación.",
+                "Los personajes se ayudan y bajan el ritmo.",
+                "Final acogedor, todos seguros y listos para dormir.",
+            ]
+        else:
+            base = [
+                "Comienza la aventura y aparece el deseo de los personajes.",
+                "Surge un problema curioso.",
+                "Una idea creativa casi funciona.",
+                "Una solución valiente y colaborativa tiene éxito.",
+                "Final completo, regreso a casa y aprendizaje.",
+            ]
+    elif language == "it":
+        if subtype == "bedtime":
+            base = [
+                "Arrivo tranquillo e presentazione dolce dei personaggi.",
+                "Una piccola scoperta serena, senza paura.",
+                "Una passeggiata calma risolve una preoccupazione.",
+                "I personaggi si aiutano e rallentano insieme.",
+                "Finale rassicurante, tutti al sicuro e pronti per dormire.",
+            ]
+        else:
+            base = [
+                "Inizio dell'avventura e desiderio dei personaggi.",
+                "Compare un problema curioso.",
+                "Un'idea creativa quasi funziona.",
+                "Una soluzione coraggiosa e collaborativa riesce.",
+                "Finale completo, ritorno a casa e piccola lezione.",
+            ]
+    elif language == "de":
+        if subtype == "bedtime":
+            base = [
+                "Ruhige Ankunft und sanfte Vorstellung der Figuren.",
+                "Eine kleine friedliche Entdeckung ohne Angst.",
+                "Ein stiller Spaziergang loest eine Sorge.",
+                "Die Figuren helfen einander und werden langsam ruhig.",
+                "Geborgener Schluss, alle sind sicher und bereit zum Schlafen.",
+            ]
+        else:
+            base = [
+                "Das Abenteuer beginnt und der Wunsch der Figuren wird klar.",
+                "Ein neugieriges Problem taucht auf.",
+                "Eine kreative Idee funktioniert fast.",
+                "Eine mutige gemeinsame Loesung gelingt.",
+                "Vollstaendiger Schluss, Heimkehr und kleine Erkenntnis.",
+            ]
+    else:
+        if subtype == "bedtime":
+            base = [
+                "A calm arrival and gentle character introduction.",
+                "A soft discovery with no scary surprises.",
+                "A peaceful walk that solves a small worry.",
+                "The characters help each other slow down.",
+                "A cozy ending with everyone safe and ready to sleep.",
+            ]
+        else:
+            base = [
+                "The adventure begins and the characters' wish is introduced.",
+                "A curious problem appears.",
+                "A creative attempt almost works.",
+                "A brave collaborative solution succeeds.",
+                "A complete ending brings everyone home with a lesson.",
+            ]
+    return base[:chapter_count]
+
+
+def _start_story_session_from_intent(state: RobotRuntimeState, intent: dict, user_text: str) -> StorySession:
+    language = intent.get("response_language") or intent.get("language") or ("pt" if "historia" in normalize_command_text(user_text) else "en")
+    if language not in SUPPORTED_STORY_LANGUAGES or language == "unknown":
+        language = intent.get("language") if intent.get("language") in SUPPORTED_STORY_LANGUAGES else "en"
+    subtype = intent.get("subtype") or "general"
+    chapter_count = int(intent.get("chapter_count") or 3)
+    topic = str(intent.get("setting") or "").strip() or _extract_long_story_topic_hint(user_text) or _clean_story_topic(_extract_long_story_topic(user_text))
+    title = _story_title_from_topic(topic, language, subtype)
+    characters = [str(name).strip() for name in intent.get("characters") or [] if str(name).strip()]
+    session = StorySession(
+        active=True,
+        mode="story_continuous",
+        subtype=subtype,
+        language=language,
+        title=title,
+        characters=characters or _story_characters_from_text(user_text),
+        setting=str(intent.get("setting") or "").strip() or _story_setting_from_text(user_text, language),
+        chapter_count=chapter_count,
+        current_chapter=0,
+        story_plan=_build_story_plan(title, chapter_count, language, subtype),
+        target_words_per_chapter=int(intent.get("target_words_per_chapter") or 150),
+        auto_continue=True,
+    )
+    with state.lock:
+        state.story_session = session
+        state.long_story_active = True
+        state.long_story_topic = title
+        state.long_story_target_minutes = int(intent.get("requested_minutes") or 0)
+        state.long_story_max_segments = chapter_count
+        state.long_story_segment_index = 0
+        state.long_story_style = "calm bedtime" if subtype == "bedtime" else _extract_story_style(user_text)
+        state.conversation_mode = "story"
+        state.response_depth_mode = "long_story"
+        state.response_length_mode = "long_story"
+    print(
+        f"[V7.15 STORY DURATION] requested_minutes={int(intent.get('requested_minutes') or 0)} "
+        f"policy=chapter_cap chapters={chapter_count} words_per_chapter={session.target_words_per_chapter}"
+    )
+    print(
+        f"[V7.15 STORY SESSION] started=true mode=story_continuous subtype={subtype} "
+        f"language={language} chapters={chapter_count}"
+    )
+    print(f"[V7.15 STORY PLAN] title=\"{title}\" chapters={chapter_count}")
+    return session
+
+
+def _fallback_story_chapter(session: StorySession, chapter_number: int) -> str:
+    final = chapter_number >= session.chapter_count
+    if session.language == "pt":
+        names = " e ".join(session.characters)
+    elif session.language == "fr":
+        names = " et ".join(session.characters)
+    elif session.language == "es":
+        names = " y ".join(session.characters)
+    elif session.language == "it":
+        names = " e ".join(session.characters)
+    elif session.language == "de":
+        names = " und ".join(session.characters)
+    else:
+        names = " and ".join(session.characters)
+    summary = session.story_plan[chapter_number - 1] if chapter_number - 1 < len(session.story_plan) else ""
+    if session.language == "pt":
+        ending = (
+            "No fim, eles voltaram para casa com o coração tranquilo, sabendo que a aventura tinha terminado bem."
+            if final
+            else "Quando a lua subiu um pouco mais, um novo caminho apareceu, e a próxima parte começou sozinha."
+        )
+        tone = "calma e macia" if session.subtype == "bedtime" else "cheia de coragem"
+        return (
+            f"Capítulo {chapter_number}: {session.title}. {names} estavam em {session.setting}, numa noite {tone}. "
+            f"{summary} Eles encontraram uma pista pequena, pensaram juntos, e escolheram a solução mais gentil. "
+            f"Marquinho percebeu que uma boa aventura não precisa ser barulhenta para ser importante. Helena sorriu, "
+            f"Miguel piscou suas luzes, e todos seguiram com cuidado. A cada passo, eles lembravam de respirar devagar, "
+            f"escutar um ao outro, e transformar medo em curiosidade. Quando uma porta parecia fechada, Helena procurava "
+            f"um detalhe brilhante, Marquinho inventava uma ideia simples, e Miguel ajudava a testar sem pressa. "
+            f"Assim, a aventura ficava segura, bonita, e cheia de pequenas descobertas. {ending}"
+        )
+    if session.language == "fr":
+        ending = (
+            "À la fin, ils rentrèrent le cœur tranquille, certains que l'aventure s'était bien terminée."
+            if final
+            else "Quand la lune monta un peu plus haut, un nouveau chemin apparut, et le chapitre suivant commença doucement."
+        )
+        tone = "douce et calme" if session.subtype == "bedtime" else "courageuse et lumineuse"
+        return (
+            f"Chapitre {chapter_number}: {session.title}. {names} étaient à {session.setting}, pendant une soirée {tone}. "
+            f"{summary} Ils trouvèrent un petit indice, réfléchirent ensemble, puis choisirent la solution la plus gentille. "
+            f"Marquinho comprit qu'une aventure n'a pas besoin d'être bruyante pour être importante. Helena sourit, "
+            f"Miguel fit clignoter ses lumières, et chacun avança avec patience. À chaque pas, ils respiraient lentement, "
+            f"écoutaient les idées des autres, et transformaient l'inquiétude en curiosité. Quand le silence devenait profond, "
+            f"ils regardaient les étoiles comme de petites lampes amies, et l'histoire avançait sans se presser. {ending}"
+        )
+    if session.language == "es":
+        ending = (
+            "Al final, volvieron a casa con el corazón tranquilo, sabiendo que la aventura había terminado bien."
+            if final
+            else "Cuando la luna subió un poco más, apareció un nuevo camino, y el siguiente capítulo empezó suavemente."
+        )
+        tone = "suave y tranquila" if session.subtype == "bedtime" else "valiente y luminosa"
+        return (
+            f"Capítulo {chapter_number}: {session.title}. {names} estaban en {session.setting}, durante una noche {tone}. "
+            f"{summary} Encontraron una pista pequeña, pensaron juntos y eligieron la solución más amable. "
+            f"Marquinho aprendió que una aventura no necesita ser ruidosa para importar. Helena sonrió, "
+            f"Miguel encendió sus luces, y todos avanzaron con paciencia. En cada paso respiraban despacio, "
+            f"escuchaban las ideas de los demás y convertían la preocupación en curiosidad. Cuando el silencio se hacía profundo, "
+            f"miraban las estrellas como pequeñas lámparas amigas, y la historia seguía sin prisa. También guardaban cada "
+            f"descubrimiento en la memoria, como una lucecita tranquila para llevar en el corazón. {ending}"
+        )
+    if session.language == "it":
+        ending = (
+            "Alla fine tornarono a casa con il cuore tranquillo, sapendo che l'avventura era finita bene."
+            if final
+            else "Quando la luna salì un po' più in alto, apparve un nuovo sentiero, e il capitolo seguente cominciò piano."
+        )
+        tone = "dolce e calma" if session.subtype == "bedtime" else "coraggiosa e luminosa"
+        return (
+            f"Capitolo {chapter_number}: {session.title}. {names} erano in {session.setting}, durante una sera {tone}. "
+            f"{summary} Trovarono un piccolo indizio, pensarono insieme e scelsero la soluzione più gentile. "
+            f"Marquinho capì che un'avventura non deve essere rumorosa per essere importante. Helena sorrise, "
+            f"Miguel accese le sue luci, e tutti avanzarono con pazienza. A ogni passo respiravano piano, "
+            f"ascoltavano le idee degli altri e trasformavano la preoccupazione in curiosità. Quando il silenzio diventava profondo, "
+            f"guardavano le stelle come piccole lampade amiche, e la storia continuava senza fretta. {ending}"
+        )
+    if session.language == "de":
+        ending = (
+            "Am Ende gingen sie mit ruhigem Herzen nach Hause, weil das Abenteuer wirklich gut ausgegangen war."
+            if final
+            else "Als der Mond etwas höher stieg, erschien ein neuer Weg, und das nächste Kapitel begann leise."
+        )
+        tone = "sanften und ruhigen" if session.subtype == "bedtime" else "mutigen und hellen"
+        return (
+            f"Kapitel {chapter_number}: {session.title}. {names} waren in {session.setting}, an einem {tone} Abend. "
+            f"{summary} Sie fanden einen kleinen Hinweis, dachten gemeinsam nach und waehlten die freundlichste Loesung. "
+            f"Marquinho verstand, dass ein Abenteuer nicht laut sein muss, um wichtig zu sein. Helena laechelte, "
+            f"Miguel liess seine Lichter blinken, und alle gingen geduldig weiter. Bei jedem Schritt atmeten sie langsam, "
+            f"hoerten einander zu und verwandelten Sorge in Neugier. Wenn die Stille tief wurde, sahen sie zu den Sternen, "
+            f"als waeren sie kleine freundliche Lampen, und die Geschichte ging ruhig weiter. {ending}"
+        )
+    ending = (
+        "In the end, they came home peaceful and proud, knowing the adventure had truly ended well."
+        if final
+        else "As the moon climbed higher, a new path appeared, and the next part began all by itself."
+    )
+    tone = "soft and calm" if session.subtype == "bedtime" else "brave and bright"
+    return (
+        f"Chapter {chapter_number}: {session.title}. {names} were in {session.setting} on a {tone} evening. "
+        f"{summary} They found a tiny clue, thought together, and chose the kindest solution. "
+        f"Marquinho learned that an adventure does not need to be loud to matter. Helena smiled, "
+        f"Miguel blinked his lights, and everyone moved carefully. With each step, they remembered to breathe slowly, "
+        f"listen to one another, and turn worry into curiosity. When a door seemed closed, Helena searched for a bright "
+        f"detail, Marquinho invented a simple idea, and Miguel helped test it without rushing. "
+        f"That made the adventure safe, beautiful, and full of small discoveries. {ending}"
+    )
+
+
+def _generate_story_chapter(session: StorySession, user_text: str, chapter_number: int) -> str:
+    final = chapter_number >= session.chapter_count
+    language_names = {
+        "pt": "Portuguese",
+        "en": "English",
+        "fr": "French",
+        "es": "Spanish",
+        "it": "Italian",
+        "de": "German",
+    }
+    language_name = language_names.get(session.language, session.language or "the user's language")
+    tone = "calm, gentle, non-scary bedtime" if session.subtype == "bedtime" else "family-safe adventure"
+    prompt = (
+        f"Write chapter {chapter_number} of {session.chapter_count} for a continuous spoken story. "
+        f"Language: {language_name}. Tone: {tone}. Title: {session.title}. "
+        f"Characters: {', '.join(session.characters)}. Setting: {session.setting}. "
+        f"Chapter plan: {' | '.join(session.story_plan)}. "
+        f"Target {session.target_words_per_chapter - 30} to {session.target_words_per_chapter + 30} spoken words. "
+        "Do not ask whether to continue. "
+        + ("This is the final chapter; conclude the story gently and completely. " if final else "End naturally but allow the next chapter to continue. ")
+        + f"Original user request: {user_text}"
+    )
+    ask_cloud = getattr(v6, "ask_cloud_brain", None)
+    if callable(ask_cloud):
+        try:
+            reply = str(ask_cloud(prompt, _neutral_conversation_face_state()) or "").strip()
+            if reply:
+                return trim_to_word_limit_preserve_sentence(reply, session.target_words_per_chapter + 30)
+        except Exception as exc:
+            print("[V7.15 STORY CHAPTER] cloud_generation_warning=", exc)
+    return trim_to_word_limit_preserve_sentence(_fallback_story_chapter(session, chapter_number), session.target_words_per_chapter + 30)
+
+
+def _route_story_stop_request(user_text: str, state: RobotRuntimeState) -> bool:
+    if not _is_story_stop_request(user_text):
+        return False
+    with state.lock:
+        active = bool(state.story_session.active)
+        state.story_session.stop_requested = True
+        state.long_story_active = False
+    if not active:
+        return False
+    state.stop_speech_event.set()
+    print("[V7.15 STORY SESSION] stopped=true reason=user_stop_command")
+    v6.speak("Está bem. Vou parar a história por aqui." if "historia" in normalize_command_text(user_text) else "Okay. I will stop the story here.")
+    return True
+
+
+def _route_story_duration_reality_question(user_text: str) -> bool:
+    normalized = normalize_command_text(user_text)
+    if not normalized:
+        return False
+    if _extract_long_story_duration_minutes(normalized) and any(
+        marker in normalized
+        for marker in {
+            "will it really be",
+            "really be",
+            "exactly",
+            "literal",
+            "vai ser mesmo",
+            "realmente vai ser",
+            "exatamente",
+        }
+    ):
+        v6.speak("Not exactly. I will make it a longer chaptered story, but I will keep it voice-friendly so it does not take too long.")
+        return True
+    return False
+
+
+def _route_story_continuous_generation(user_text: str, state: RobotRuntimeState, intent: dict) -> bool:
+    if not (intent.get("detected") and intent.get("action") == "generate_story" and intent.get("story_mode") == "story_continuous"):
+        return False
+    _log_story_execution_generate()
+    _log_story_execution_skip_legacy("story_request")
+    session = _start_story_session_from_intent(state, intent, user_text)
+    _set_reply_context(state, "story")
+    _set_response_length_context(state, "long_story")
+    for chapter_number in range(1, session.chapter_count + 1):
+        with state.lock:
+            if state.story_session.stop_requested:
+                print("[V7.15 STORY SESSION] stopped=true reason=user_stop_command")
+                return True
+            state.story_session.current_chapter = chapter_number
+            state.long_story_segment_index = chapter_number
+        if chapter_number < session.chapter_count:
+            print(f"[V7.15 STORY PREFETCH] generating_next={chapter_number + 1} while_speaking={chapter_number}")
+        chapter = _generate_story_chapter(session, user_text, chapter_number)
+        words = _word_len(chapter)
+        with state.lock:
+            state.story_session.generated_chapters[chapter_number] = chapter
+        print(f"[V7.15 STORY CHAPTER] generated={chapter_number} queued_to_speech=true words={words}")
+        v6.speak(chapter)
+        if chapter_number < session.chapter_count:
+            print(f"[V7.15 STORY PREFETCH] ready_next={chapter_number + 1}")
+            print(f"[V7.15 STORY CHAPTER] auto_continue={chapter_number + 1}")
+    with state.lock:
+        state.story_session.active = False
+        state.long_story_active = False
+        state.long_story_segment_index = 0
+        state.conversation_mode = "general"
+        state.response_depth_mode = "normal"
+        state.response_length_mode = "normal"
+    print(f"[V7.15 STORY SESSION] completed=true chapters_spoken={session.chapter_count}")
+    return True
 
 
 def _long_story_segment(topic: str, segment_index: int, max_segments: int) -> str:
@@ -5257,9 +6238,19 @@ def _route_long_story_mode(user_text: str, state: RobotRuntimeState) -> bool:
         v6.speak("Normal mode on. I'll keep answers shorter.")
         return True
 
+    story_detection = _story_mode_detection(user_text)
+    with state.lock:
+        current_depth_mode = state.response_depth_mode
+    if (
+        story_detection.get("mode") == "long_story"
+        and story_detection.get("has_story_request")
+    ) or current_depth_mode == "long_story":
+        _log_story_execution_skip_legacy("story_request")
+        return False
+
     if _is_long_mode_request(user_text):
         topic = _extract_long_story_topic_hint(user_text) or _clean_story_topic(_extract_long_story_topic(user_text)) or "this story"
-        narrative = any(phrase in normalized for phrase in {"story", "bedtime"})
+        narrative = _contains_story_word(normalized) or any(phrase in normalized for phrase in {"bedtime"})
         target_minutes = _extract_long_story_duration_minutes(user_text)
         story_style = _extract_story_style(user_text)
         recovered_context = _recover_story_context_from_logs(user_text, state)
@@ -8179,26 +9170,62 @@ def handle_queued_turn(
         state.current_turn_latency.setdefault("turn_started_at", turn_started_at)
     print(f"[V7.5 TRANSCRIPT] {user_text}")
 
+    if _route_story_stop_request(user_text, state):
+        _set_response_length_context(state, "terse")
+        _mark_route_done(state, turn_started_at)
+        return True
+
     _set_reply_context(state, "language_policy")
     if _route_language_policy_local_reply(user_text, state):
         _set_response_length_context(state, "terse")
         _mark_route_done(state, turn_started_at)
         return True
 
-    if not _language_policy_allows_turn(user_text, state):
+    story_detection = _story_mode_detection(user_text)
+    if _route_low_confidence_story_intent(story_detection, state):
+        _mark_route_done(state, turn_started_at)
+        return True
+
+    story_request_allowed = bool(story_detection.get("detected") and story_detection.get("action") == "generate_story")
+    if not story_request_allowed and not _language_policy_allows_turn(user_text, state):
         _mark_route_done(state, turn_started_at)
         force_interaction_state(state, _ready_face_state(), _ready_face_text(state))
         return True
 
+    if _route_story_duration_reality_question(user_text):
+        _set_response_length_context(state, "normal")
+        _mark_route_done(state, turn_started_at)
+        return True
+
     new_story_requested = _is_new_story_request(user_text)
     if new_story_requested:
+        _log_story_mode_detection(story_detection)
+        if story_detection.get("has_story_request"):
+            _log_story_execution_generate()
         _start_new_story_topic(state, user_text, partner=partner)
         with state.lock:
             if state.response_depth_mode == "normal":
                 state.response_depth_mode = "long_story"
+            if state.conversation_mode in {"general", "wake_required"}:
+                state.conversation_mode = "story"
+            state.current_turn_latency["reply_context"] = "story"
             state.current_turn_latency["response_depth_mode"] = state.response_depth_mode
             state.current_turn_latency["long_story_target_minutes"] = state.long_story_target_minutes
         _set_response_length_context(state, "long_story")
+
+    if story_detection.get("story_mode") == "story_continuous":
+        hard_stop_reason, hard_stop_reply = _local_safety_hard_stop(user_text)
+        if hard_stop_reply:
+            print(f"[V7.14 SAFETY ROUTER] local_hard_stop reason={hard_stop_reason}")
+            _set_reply_context(state, "safety_refusal")
+            _set_response_length_context(state, "terse")
+            v6.speak(hard_stop_reply)
+            _mark_route_done(state, turn_started_at)
+            return True
+
+    if _route_story_continuous_generation(user_text, state, story_detection):
+        _mark_route_done(state, turn_started_at)
+        return True
 
     _remember_accepted_turn(state, user_text)
     if not new_story_requested:
@@ -8241,10 +9268,11 @@ def handle_queued_turn(
     normalized_for_depth = normalize_command_text(user_text)
     if (
         camera_intent == "none"
-        and _is_explicit_long_story_request(user_text)
+        and (story_detection.get("mode") == "long_story" or _is_explicit_long_story_request(user_text))
         and normalized_for_depth not in LONG_STORY_ACTIVATION_PHRASES
         and not _is_depth_status_question(user_text)
     ):
+        _log_story_mode_detection(story_detection)
         _set_response_depth_mode(state, "long_story", "explicit_long_story_request")
         response_depth_mode = "long_story"
         inferred_response_mode = "long_story"
@@ -8427,9 +9455,12 @@ def handle_queued_turn(
         story_theme = _clean_story_topic(_extract_story_theme(user_text)) or _extract_long_story_topic_hint(user_text) or "new adventure"
         story_style = _extract_story_style(user_text)
         style_clause = f" Style: {story_style}." if story_style else ""
+        response_language = story_detection.get("response_language") or story_detection.get("language") or ""
+        language_clause = f" Write the story in {response_language}. " if response_language else ""
         cloud_prompt_text = (
             f"Start a new complete story with this theme: {story_theme}. "
             "If the theme is vague, invent the full premise, characters, problem, obstacle, and ending. "
+            f"{language_clause}"
             f"{style_clause} "
             f"User request: {user_text}"
         )
@@ -8528,6 +9559,14 @@ def handle_queued_turn(
         cloud_story_style = state.long_story_style
         cloud_recovered_story_context = state.recovered_story_context
     cloud_route = "creative" if creative_fast_topic or cloud_conversation_mode in {"creative", "story"} else "normal"
+    if cloud_conversation_mode == "story":
+        cloud_route = "story"
+    if new_story_requested:
+        cloud_route = "story"
+        cloud_response_mode = "long_story"
+        cloud_depth_mode = "long_story"
+        if story_detection.get("response_language"):
+            cloud_allowed_languages = [story_detection.get("response_language")]
     _set_reply_context(state, cloud_route)
     active_topic_label = _topic_log_label(_current_active_topic(state))
     cloud_user_text = _with_cloud_reply_instructions(
@@ -8603,12 +9642,8 @@ def speech_worker(
                     and _long_story_depth_applies_to_route(route, last_user_text, conversation_mode)
                     and response_length_mode != "terse"
                 ):
-                    duration_words = _long_story_target_words(long_story_target_minutes)
-                    if duration_words:
-                        max_words = duration_words
-                    else:
-                        max_words = 250 if _is_explicit_long_story_request(last_user_text) else 180
-                        max_words = max(120 if _is_explicit_long_story_request(last_user_text) else 80, max_words)
+                    explicit_long_story = _is_explicit_long_story_request(last_user_text)
+                    max_words = _long_story_spoken_cap_words(explicit_long_story)
                     print(
                         f"[V7.15 LENGTH] depth=long_story allowed_words={max_words} "
                         f"target_minutes={long_story_target_minutes}"
