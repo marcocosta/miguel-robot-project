@@ -7,17 +7,25 @@ MEMORY_DIR = Path.home() / "robot-project/week3/memory"
 MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
 MEMORY_PATH = MEMORY_DIR / "miguel_memory.json"
+CONVERSATION_LOG_DIR = MEMORY_DIR / "conversation_logs"
+CONVERSATION_ARCHIVE_SUMMARY_PATH = MEMORY_DIR / "conversation_log_archive_summaries.jsonl"
+CONVERSATION_LOG_RETENTION_DAYS = 30
+CONVERSATION_LOG_MAX_BYTES = 200 * 1024 * 1024
 
 DEFAULT_MEMORY = {
+    "memory_schema_version": 2,
     "robot_mode": "normal",
     "personality_mode": "mission_control",
-    "voice_mode": "robot_voice",
     "enrollment_unlock": {"active": False, "authorized_by": None, "expires_at": 0},
-    "voice_mode": "robot_voice",
-    "enrollment_unlock": {"active": False, "authorized_by": None, "expires_at": 0},
-    "voice_mode": "natural_robot",
+    "voice_mode": "natural_voice",
     "pending_shutdown": False,
     "active_topic_id": None,
+    "self_learning": {
+        "enabled": True,
+        "approved_facts": [],
+        "pending_candidates": [],
+        "last_reviewed_at": None,
+    },
     "profiles": {
         "marco": {
             "role": "Systems Engineer",
@@ -65,8 +73,12 @@ def load_memory():
     for k, v in DEFAULT_MEMORY.items():
         data.setdefault(k, v)
 
+    data["memory_schema_version"] = max(int(data.get("memory_schema_version") or 1), DEFAULT_MEMORY["memory_schema_version"])
+    data.setdefault("self_learning", {})
+    for k, v in DEFAULT_MEMORY["self_learning"].items():
+        data["self_learning"].setdefault(k, v)
     data.setdefault("long_term_topics", {})
-    data.setdefault("voice_mode", "robot_voice")
+    data["voice_mode"] = normalize_voice_mode(data.get("voice_mode", "natural_voice"))
     data.setdefault("enrollment_unlock", {"active": False, "authorized_by": None, "expires_at": 0})
     data.setdefault("active_topic_id", None)
 
@@ -77,6 +89,251 @@ def save_memory(memory):
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     with open(MEMORY_PATH, "w", encoding="utf-8") as f:
         json.dump(memory, f, indent=2, ensure_ascii=False)
+
+
+def _conversation_log_session_id():
+    return time.strftime("%Y%m%d_%H%M%S")
+
+
+def start_conversation_log_session():
+    CONVERSATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    session_id = _conversation_log_session_id()
+    path = CONVERSATION_LOG_DIR / f"{session_id}.jsonl"
+    event = {
+        "type": "session_start",
+        "session_id": session_id,
+        "created_at": now_ts(),
+        "retention": {
+            "full_log_days": CONVERSATION_LOG_RETENTION_DAYS,
+            "max_total_bytes": CONVERSATION_LOG_MAX_BYTES,
+            "deleted_logs_keep_short_summary": True,
+        },
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+    cleanup_conversation_logs()
+    return {"session_id": session_id, "path": str(path)}
+
+
+def append_conversation_log_event(session_id, event_type, **payload):
+    if not session_id:
+        return
+    CONVERSATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    path = CONVERSATION_LOG_DIR / f"{session_id}.jsonl"
+    event = {
+        "type": event_type,
+        "session_id": session_id,
+        "created_at": now_ts(),
+    }
+    event.update(payload)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def _read_jsonl(path):
+    events = []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    events.append(json.loads(line))
+    except Exception:
+        return []
+    return events
+
+
+def _summarize_log_for_archive(path):
+    events = _read_jsonl(path)
+    turns = [e for e in events if e.get("type") == "turn"]
+    text = " ".join(
+        str(e.get("user_text") or "") + " " + str(e.get("assistant_reply") or "")
+        for e in turns
+    )
+    unsafe_markers = [
+        "weapon", "bomb", "kill", "hurt", "self harm", "suicide",
+        "password", "enroll", "shutdown", "unsafe", "inappropriate",
+    ]
+    flagged = [m for m in unsafe_markers if m in text.lower()]
+    snippets = []
+    for e in turns[:6]:
+        user = re.sub(r"\s+", " ", str(e.get("user_text") or "")).strip()
+        if user:
+            snippets.append(user[:90])
+    return {
+        "type": "deleted_log_summary",
+        "deleted_file": path.name,
+        "deleted_at": now_ts(),
+        "session_id": path.stem,
+        "turn_count": len(turns),
+        "first_event_at": events[0].get("created_at") if events else None,
+        "last_event_at": events[-1].get("created_at") if events else None,
+        "possible_sensitive_markers": flagged[:10],
+        "short_summary": "; ".join(snippets)[:500] or "No turn text captured.",
+    }
+
+
+def _archive_and_delete_log(path):
+    summary = _summarize_log_for_archive(path)
+    with open(CONVERSATION_ARCHIVE_SUMMARY_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def cleanup_conversation_logs():
+    CONVERSATION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    now = now_ts()
+    paths = sorted(CONVERSATION_LOG_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    cutoff = now - CONVERSATION_LOG_RETENTION_DAYS * 86400
+    for path in list(paths):
+        try:
+            if path.stat().st_mtime < cutoff:
+                _archive_and_delete_log(path)
+        except FileNotFoundError:
+            pass
+
+    paths = sorted(CONVERSATION_LOG_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime)
+    total = sum(p.stat().st_size for p in paths if p.exists())
+    for path in paths:
+        if total <= CONVERSATION_LOG_MAX_BYTES:
+            break
+        try:
+            size = path.stat().st_size
+            _archive_and_delete_log(path)
+            total -= size
+        except FileNotFoundError:
+            pass
+
+
+def list_conversation_logs(limit=8):
+    cleanup_conversation_logs()
+    paths = sorted(CONVERSATION_LOG_DIR.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    results = []
+    for path in paths[:limit]:
+        events = _read_jsonl(path)
+        turns = [e for e in events if e.get("type") == "turn"]
+        topics = []
+        for e in turns:
+            topic = str(e.get("topic") or "").strip()
+            if topic and topic not in topics:
+                topics.append(topic)
+        results.append({
+            "session_id": path.stem,
+            "path": str(path),
+            "updated_at": path.stat().st_mtime,
+            "turn_count": len(turns),
+            "topics": topics[:5],
+        })
+    return results
+
+
+def _conversation_log_date_token(offset_days=0):
+    return time.strftime("%Y%m%d", time.localtime(now_ts() + (offset_days * 86400)))
+
+
+def select_conversation_logs(query="", current_session_id=None, limit=3):
+    """Select logs for memory recall/analysis without exposing file details to callers."""
+    normalized = re.sub(r"\s+", " ", str(query or "").lower()).strip()
+    logs = list_conversation_logs(limit=50)
+
+    if current_session_id:
+        current_session_id = str(current_session_id)
+
+    selected = logs
+    if "yesterday" in normalized:
+        token = _conversation_log_date_token(-1)
+        selected = [log for log in logs if str(log.get("session_id", "")).startswith(token)]
+        if not selected:
+            selected = [log for log in logs if log.get("session_id") != current_session_id]
+    elif "today" in normalized:
+        token = _conversation_log_date_token(0)
+        selected = [log for log in logs if str(log.get("session_id", "")).startswith(token)]
+    elif any(marker in normalized for marker in ("previous", "last conversation", "last log", "last interaction", "before this")):
+        selected = [log for log in logs if log.get("session_id") != current_session_id]
+
+    selected = [log for log in selected if int(log.get("turn_count") or 0) > 0]
+    return [
+        {
+            "metadata": log,
+            "events": _read_jsonl(Path(log["path"])),
+        }
+        for log in selected[:limit]
+    ]
+
+
+def load_conversation_log(session_id=None, limit=1):
+    logs = list_conversation_logs(limit=max(1, limit if session_id is None else 50))
+    if session_id:
+        wanted = str(session_id).strip()
+        logs = [log for log in logs if wanted in log["session_id"]]
+    selected = logs[:limit]
+    return [
+        {
+            "metadata": log,
+            "events": _read_jsonl(Path(log["path"])),
+        }
+        for log in selected
+    ]
+
+
+def format_recent_conversation_topics(limit=5):
+    logs = list_conversation_logs(limit=limit)
+    if not logs:
+        return "I do not have conversation logs yet."
+    parts = []
+    for log in logs:
+        topics = ", ".join(log.get("topics") or []) or "general conversation"
+        parts.append(f"{log['session_id']}: {topics}")
+    return "Recent conversation topics: " + "; ".join(parts) + "."
+
+
+def format_conversation_log_recall(query="", current_session_id=None, limit=3):
+    logs = select_conversation_logs(query=query, current_session_id=current_session_id, limit=limit)
+    if not logs:
+        return "I do not have matching conversation logs yet."
+
+    parts = []
+    for log in logs:
+        metadata = log.get("metadata", {})
+        turns = [event for event in log.get("events", []) if event.get("type") == "turn"]
+        snippets = []
+        for event in turns[-4:]:
+            user = re.sub(r"\s+", " ", str(event.get("user_text") or "")).strip()
+            topic = str(event.get("topic") or "").strip()
+            if user:
+                snippets.append(user[:80])
+            elif topic:
+                snippets.append(topic[:80])
+        topics = ", ".join(metadata.get("topics") or []) or "general conversation"
+        if snippets:
+            parts.append(f"{metadata.get('session_id')}: {topics}. Recent: " + "; ".join(snippets))
+        else:
+            parts.append(f"{metadata.get('session_id')}: {topics}")
+    return "I found these conversation logs: " + " | ".join(parts) + "."
+
+
+def add_learning_candidate(kind, text, source="conversation", metadata=None):
+    text = str(text or "").strip()
+    if not text:
+        return None
+    memory = load_memory()
+    learning = memory.setdefault("self_learning", {})
+    candidates = learning.setdefault("pending_candidates", [])
+    record = {
+        "kind": str(kind or "note"),
+        "text": text,
+        "source": str(source or "conversation"),
+        "metadata": metadata or {},
+        "created_at": now_ts(),
+        "approved": False,
+    }
+    candidates.append(record)
+    learning["pending_candidates"] = candidates[-100:]
+    save_memory(memory)
+    return record
 
 
 def normalize_person_name(name):
@@ -761,6 +1018,11 @@ def handle_voice_mode_command(user_text):
 
 def handle_robot_mode_command(user_text, recognized_person=None):
     text = user_text.lower().strip()
+    text = re.split(
+        r"\nmiguel (?:response length|creative|long story|long explanation|language|live conversation) instruction:",
+        text,
+        maxsplit=1,
+    )[0].strip()
     person = normalize_person_name(recognized_person)
 
     memory = load_memory()

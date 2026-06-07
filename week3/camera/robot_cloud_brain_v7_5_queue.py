@@ -295,6 +295,9 @@ class RobotRuntimeState:
     long_story_topic: str | None = None
     long_story_segment_index: int = 0
     long_story_max_segments: int = 0
+    long_story_target_minutes: int = 0
+    long_story_style: str = ""
+    recovered_story_context: str = ""
     last_prompt_type: str | None = None
     last_prompt_text: str | None = None
     last_joke_punchline: str | None = None
@@ -425,6 +428,70 @@ def _long_story_segment_words() -> int:
 
 def _long_story_max_segments() -> int:
     return max(1, _env_int("MIGUEL_LONG_STORY_MAX_SEGMENTS", 5))
+
+
+def _long_story_words_per_minute() -> int:
+    return max(80, _env_int("MIGUEL_LONG_STORY_WORDS_PER_MINUTE", 135))
+
+
+def _long_story_max_target_minutes() -> int:
+    return max(1, _env_int("MIGUEL_LONG_STORY_MAX_TARGET_MINUTES", 30))
+
+
+NUMBER_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "thirty": 30,
+}
+
+
+def _extract_long_story_duration_minutes(text: str) -> int:
+    normalized = normalize_command_text(text)
+    if not normalized or "minute" not in normalized:
+        return 0
+    match = re.search(r"\b(\d{1,2})\s*(?:-| )?\s*minutes?\b", normalized)
+    if match:
+        minutes = int(match.group(1))
+        return max(1, min(_long_story_max_target_minutes(), minutes))
+    match = re.search(r"\b([a-z]+)\s*(?:-| )?\s*minutes?\b", normalized)
+    if not match:
+        return 0
+    minutes = NUMBER_WORDS.get(match.group(1), 0)
+    if not minutes:
+        return 0
+    return max(1, min(_long_story_max_target_minutes(), minutes))
+
+
+def _long_story_target_words(minutes: int) -> int:
+    minutes = max(0, int(minutes or 0))
+    if not minutes:
+        return 0
+    return max(120, minutes * _long_story_words_per_minute())
+
+
+def _format_long_story_duration(minutes: int) -> str:
+    minutes = int(minutes or 0)
+    if minutes <= 0:
+        return ""
+    return f"{minutes} minute" + ("" if minutes == 1 else "s")
 
 
 def _conversation_timeout_seconds(mode: str = "general") -> float:
@@ -1218,6 +1285,9 @@ def _set_response_depth_mode(state: RobotRuntimeState, mode: str, reason: str) -
             state.long_story_active = False
             state.long_story_topic = None
             state.long_story_segment_index = 0
+            state.long_story_target_minutes = 0
+            state.long_story_style = ""
+            state.recovered_story_context = ""
             if state.conversation_mode == "story":
                 state.conversation_mode = "general"
             if state.response_length_mode in {"long_story", "detailed"}:
@@ -1285,9 +1355,14 @@ def _route_depth_status_local_reply(user_text: str, state: RobotRuntimeState) ->
     with state.lock:
         depth = state.response_depth_mode
         conversation_mode = state.conversation_mode
+        target_minutes = state.long_story_target_minutes
     if depth == "long_story":
-        prefix = "creative mode" if conversation_mode in {"creative", "story"} else "normal conversation mode"
-        reply = f"I'm in {prefix}, with long story mode on."
+        prefix = "story mode" if conversation_mode == "story" else "normal conversation mode"
+        duration = _format_long_story_duration(target_minutes)
+        reply = f"I'm in {prefix}, with long story mode on"
+        if duration:
+            reply += f" for about {duration}"
+        reply += "."
     elif depth == "long_explanation":
         reply = "I'm in normal conversation mode, with long explanation mode on."
     else:
@@ -1302,6 +1377,8 @@ def _is_explicit_long_story_request(text: str) -> bool:
     normalized = normalize_command_text(text)
     if not normalized:
         return False
+    if _extract_long_story_duration_minutes(text) and "story" in normalized:
+        return True
     markers = {
         "long story",
         "longer story",
@@ -2806,6 +2883,9 @@ def _is_story_continue_text(text: str) -> bool:
     return normalized in STORY_CONTINUATION_PHRASES or any(
         normalized.startswith(phrase + " ") or phrase in normalized
         for phrase in {
+            "continua",
+            "continue miguel",
+            "continua miguel",
             "continue the story",
             "keep going",
             "keep it going",
@@ -2820,6 +2900,8 @@ def _is_new_story_request(text: str) -> bool:
     normalized = normalize_command_text(text)
     if not normalized or "story" not in normalized:
         return False
+    if _extract_long_story_duration_minutes(text) and not _is_mode_command_not_physical(normalized):
+        return True
     return any(
         marker in normalized
         for marker in {
@@ -2843,6 +2925,8 @@ def _extract_story_theme(text: str) -> str:
     if not normalized:
         return "new adventure"
     patterns = [
+        r"\bstory mode\b.*?\b(?:about|around|with|on)\s+(.+)$",
+        r"\bstory\b.*?\b(?:about|around|with|on)\s+(.+)$",
         r"\bstory\s+(?:about|around|with)\s+(.+)$",
         r"\b(?:make|create|invent|tell me|tell)\s+(?:a\s+)?(?:new\s+)?story\s+(?:about|around|with)\s+(.+)$",
         r"\bchange\s+(?:the\s+)?story\s+(?:to|for|into|about)\s+(.+)$",
@@ -2856,6 +2940,178 @@ def _extract_story_theme(text: str) -> str:
     if _is_new_story_request(normalized):
         return "new adventure"
     return normalized or "new adventure"
+
+
+def _clean_story_topic(topic: str) -> str:
+    topic = normalize_command_text(topic)
+    if not topic:
+        return ""
+    topic = re.sub(r"\b(?:for|about)?\s*\d{1,2}\s*(?:-| )?\s*minutes?\b", " ", topic)
+    topic = re.sub(
+        r"\b(?:for|about)?\s*(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty)\s*(?:-| )?\s*minutes?\b",
+        " ",
+        topic,
+    )
+    topic = re.sub(
+        r"\b(?:please|yeah|miguel|now|can you|could you|would you|creative mode|long story mode|story mode|long mode|go to|switch to|set|make it|make this|tell a story|tell me a story|for me)\b",
+        " ",
+        topic,
+    )
+    topic = re.sub(r"\b(?:at the same time|same time|five minutes long|ten minutes long)\b", " ", topic)
+    topic = re.sub(r"\b(?:the\s+)?topic\s+is\s+", " ", topic)
+    topic = re.sub(r"\b(?:style|tone|genre)\s+is\s+[a-z ]{2,40}$", " ", topic)
+    topic = re.sub(r"\b(?:in|with)\s+(?:a\s+)?[a-z ]{2,30}\s+(?:style|tone|genre)\b", " ", topic)
+    topic = re.sub(r"\b(?:and\s+)?tell\s+(?:us|me)?\s*(?:a\s+)?(?:long\s+)?story\s*(?:about|on)?\s*", " ", topic)
+    topic = re.sub(r"\b(?:and\s+)?a\s+(?:story|about)\b", " ", topic)
+    topic = re.sub(r"^(?:about|around|with|on)\s+", "", topic.strip())
+    topic = re.sub(r"\s+", " ", topic).strip(" .,:;!?")
+    return "" if topic in {"your", "you", "me", "this", "that"} else topic
+
+
+STORY_STYLE_KEYWORDS = {
+    "adventure": "adventure",
+    "action": "action adventure",
+    "funny": "funny",
+    "silly": "silly",
+    "comedy": "funny",
+    "mystery": "mystery",
+    "detective": "mystery",
+    "spooky": "gentle spooky",
+    "scary": "gentle spooky",
+    "creepy": "gentle spooky",
+    "bedtime": "calm bedtime",
+    "calm": "calm bedtime",
+    "gentle": "gentle",
+    "epic": "epic adventure",
+    "space": "space adventure",
+    "sci fi": "science fiction",
+    "sci-fi": "science fiction",
+    "science fiction": "science fiction",
+    "star wars": "space adventure",
+    "superhero": "superhero adventure",
+    "educational": "educational adventure",
+}
+
+
+def _extract_story_style(text: str) -> str:
+    normalized = normalize_command_text(text)
+    if not normalized:
+        return ""
+    def styles_from(raw_text: str) -> list[str]:
+        matches = []
+        for keyword, style in STORY_STYLE_KEYWORDS.items():
+            index = raw_text.find(keyword)
+            if index >= 0:
+                matches.append((index, style))
+        found = []
+        for _, style in sorted(matches, key=lambda item: item[0]):
+            if style not in found:
+                found.append(style)
+        return found
+
+    explicit_patterns = [
+        r"\b(?:style|tone|genre)\s+is\s+([a-z ]{2,40})",
+        r"\b(?:in|with)\s+(?:a\s+)?([a-z ]{2,30})\s+(?:style|tone|genre)\b",
+    ]
+    for pattern in explicit_patterns:
+        match = re.search(pattern, normalized)
+        if match:
+            raw = re.sub(r"\b(?:story|please|for me|and|but)\b", " ", match.group(1))
+            raw = re.sub(r"\s+", " ", raw).strip()
+            found = styles_from(raw)
+            if found:
+                return " ".join(found[:2])
+            if raw:
+                return raw[:40]
+    make_match = re.search(r"\bmake\s+it\s+([a-z ]{2,30})\b", normalized)
+    if make_match:
+        raw = re.sub(r"\s+", " ", make_match.group(1)).strip()
+        found = styles_from(raw)
+        if found:
+            return " ".join(found[:2])
+    found = styles_from(normalized)
+    if found:
+        return " ".join(found[:2])
+    return ""
+
+
+def _extract_long_story_topic_hint(text: str) -> str:
+    theme = _extract_story_theme(text)
+    if theme and theme != "new adventure":
+        cleaned = _clean_story_topic(theme)
+        if cleaned:
+            return cleaned
+    topic = _extract_long_story_topic(text)
+    topic = _clean_story_topic(topic)
+    return "" if topic in {"this topic", "bedtime story", "new adventure"} else topic
+
+
+def _remember_long_story_topic(state: RobotRuntimeState, topic: str) -> None:
+    topic = _clean_story_topic(topic)
+    if not topic:
+        return
+    now = time.time()
+    story_topic = {"label": f"story: {topic}", "name": topic, "category": "story"}
+    with state.lock:
+        state.active_topic = dict(story_topic)
+        state.active_topic_updated_at = now
+        state.session_topic = "story"
+        state.last_user_creative_subject = topic
+        state.last_topic = str(story_topic["label"])
+        state.last_topic_until = now + 600.0
+        state.long_story_topic = str(story_topic["label"])
+
+
+def _should_recover_story_context(text: str) -> bool:
+    normalized = normalize_command_text(text)
+    if not normalized:
+        return False
+    return bool(
+        _is_story_continue_text(normalized)
+        or any(marker in normalized for marker in {
+            "continue yesterday",
+            "continue the previous story",
+            "continue previous story",
+            "continue last story",
+            "resume the story",
+            "resume yesterday",
+            "go back to the story",
+            "yesterday story",
+            "previous story",
+            "last story",
+        })
+    )
+
+
+def _recover_story_context_from_logs(user_text: str, state: RobotRuntimeState, max_chars: int = 1800) -> str:
+    if not _should_recover_story_context(user_text):
+        return ""
+    with state.lock:
+        current_session_id = state.conversation_log_session_id
+    logs = robot_memory.select_conversation_logs(
+        query=user_text,
+        current_session_id=current_session_id,
+        limit=5,
+    )
+    snippets = []
+    for log in logs:
+        metadata = log.get("metadata", {})
+        for event in log.get("events", []):
+            if event.get("type") != "turn":
+                continue
+            topic = normalize_command_text(event.get("topic") or "")
+            user = str(event.get("user_text") or "").strip()
+            assistant = str(event.get("assistant_reply") or "").strip()
+            combined = normalize_command_text(user + " " + assistant)
+            if "story" not in topic and "story" not in combined and "chapter" not in combined:
+                continue
+            snippets.append(
+                f"{metadata.get('session_id')}: user={_safe_memory_snippet(user, 160)} reply={_safe_memory_snippet(assistant, 260)}"
+            )
+    if not snippets:
+        return ""
+    text = " | ".join(snippets[-6:])
+    return text[-max_chars:]
 
 
 def _extract_creative_topic(text: str) -> dict | None:
@@ -2972,9 +3228,12 @@ def _update_active_topic_from_text(state: RobotRuntimeState, text: str) -> dict 
 
 
 def _start_new_story_topic(state: RobotRuntimeState, text: str, partner: str | None = None) -> str:
-    theme = _extract_story_theme(text)
+    theme = _clean_story_topic(_extract_story_theme(text)) or "new adventure"
     topic = {"label": f"story: {theme}", "name": theme, "category": "story"}
     now = time.time()
+    target_minutes = _extract_long_story_duration_minutes(text)
+    story_style = _extract_story_style(text)
+    recovered_context = _recover_story_context_from_logs(text, state)
     with state.lock:
         state.active_topic = dict(topic)
         state.active_topic_updated_at = now
@@ -2986,6 +3245,9 @@ def _start_new_story_topic(state: RobotRuntimeState, text: str, partner: str | N
         state.long_story_topic = str(topic["label"])
         state.long_story_segment_index = 0
         state.long_story_max_segments = 0
+        state.long_story_target_minutes = target_minutes
+        state.long_story_style = story_style
+        state.recovered_story_context = recovered_context
         state.conversation_mode = "story"
     start_conversation_session(state, mode="story", partner=partner or _current_owner_partner(state), reason="new_story")
     print(f"[V7.15 STORY] new_topic={_topic_log_label(topic)}")
@@ -3426,6 +3688,8 @@ def _is_correction_retry_text(text: str) -> bool:
 
 def infer_response_length_mode(text: str, conversation_mode: str = "general", camera_intent: str = "none") -> str:
     normalized = normalize_command_text(text)
+    if _extract_long_story_duration_minutes(text) and "story" in normalized:
+        return "long_story"
     if _is_explicit_long_story_request(text) or any(
         phrase in normalized
         for phrase in {
@@ -3538,6 +3802,9 @@ def _with_cloud_reply_instructions(
     response_depth_mode: str = "normal",
     active_topic: str = "",
     allowed_languages: list[str] | None = None,
+    long_story_target_minutes: int = 0,
+    story_style: str = "",
+    recovered_story_context: str = "",
 ) -> str:
     prompt = _with_response_length_instruction(user_text, mode)
     depth = str(response_depth_mode or "normal").strip().lower()
@@ -3553,11 +3820,33 @@ def _with_cloud_reply_instructions(
         )
     if depth == "long_story" and (route_hint == "creative" or conversation_mode in {"creative", "story"}):
         topic_line = f" Current creative topic: {active_topic}." if active_topic else ""
+        duration_line = ""
+        if long_story_target_minutes:
+            target_words = _long_story_target_words(long_story_target_minutes)
+            duration_line = (
+                f" Aim for about {_format_long_story_duration(long_story_target_minutes)} of uninterrupted spoken story, "
+                f"around {target_words} words if the model can fit it. This overrides any shorter long-story word count."
+            )
+        style_line = f" Requested story style: {story_style}." if story_style else ""
+        recovered_line = (
+            f" Previous story context to continue from: {recovered_story_context}. "
+            if recovered_story_context
+            else ""
+        )
+        paragraph_instruction = (
+            "Use multiple spoken paragraphs"
+            if long_story_target_minutes
+            else "Answer in 2 to 4 short spoken paragraphs"
+        )
         prompt += (
-            "\nMiguel long story instruction: Answer in 2 to 4 short spoken paragraphs. "
+            f"\nMiguel long story instruction: {paragraph_instruction}. "
             "Continue the remembered idea when context is available. Use vivid, family-safe details. "
-            "Include a beginning, middle, and ending, or clearly say Part 1 if you are continuing. "
-            f"{topic_line} For superheroes include name, problem, obstacle, creative solution, and ending or cliffhanger. "
+            "Include a beginning, middle, and a real closed ending for the current story or chapter. "
+            "Do not stop mid-scene. You may close with 'The End of Chapter 1' if future chapters can continue later. "
+            f"{duration_line} "
+            f"{style_line} "
+            f"{recovered_line}"
+            f"{topic_line} For superheroes include name, problem, obstacle, creative solution, and a closed chapter ending. "
             "For machines include what it does, how it works in kid-friendly terms, one fun feature, and one possible next upgrade."
         )
     elif depth == "long_explanation":
@@ -3574,6 +3863,8 @@ def _live_conversation_context_for_cloud(state: RobotRuntimeState) -> str:
         mode = state.conversation_mode
         topic = state.session_focus or state.last_topic or ""
         recent_turns = list(state.recent_conversation_turns[-6:])
+        story_style = state.long_story_style
+        recovered_story_context = state.recovered_story_context
     parts = [
         f"conversation_mode={mode or 'general'}",
         f"current_person={partner or 'unknown'}",
@@ -3582,6 +3873,10 @@ def _live_conversation_context_for_cloud(state: RobotRuntimeState) -> str:
         parts.append(f"current_topic={topic}")
     if recent_turns:
         parts.append("recent_user_turns=" + " | ".join(recent_turns))
+    if story_style:
+        parts.append(f"story_style={story_style}")
+    if recovered_story_context:
+        parts.append("recovered_story_context=" + recovered_story_context[-500:])
     return "\nMiguel live conversation context: " + "; ".join(parts)
 
 
@@ -4427,6 +4722,14 @@ def _route_response_depth_mode(user_text: str, state: RobotRuntimeState) -> bool
     normalized = normalize_command_text(user_text)
     if not normalized:
         return False
+    target_minutes = _extract_long_story_duration_minutes(user_text)
+    topic_hint = _extract_long_story_topic_hint(user_text)
+    story_style = _extract_story_style(user_text)
+    recovered_context = _recover_story_context_from_logs(user_text, state)
+    generate_story_now = _is_story_generation_request(user_text) or (
+        _is_explicit_long_story_request(user_text)
+        and any(marker in normalized for marker in {"tell", "story about", "topic is"})
+    )
 
     if _is_depth_status_question(user_text):
         return False
@@ -4440,12 +4743,20 @@ def _route_response_depth_mode(user_text: str, state: RobotRuntimeState) -> bool
             _set_response_length_context(state, "long_story")
             with state.lock:
                 state.long_story_active = False
-                state.long_story_topic = None
+                state.long_story_topic = f"story: {topic_hint}" if topic_hint else None
                 state.long_story_segment_index = 0
+                state.long_story_target_minutes = target_minutes
+                state.long_story_style = story_style
+                state.recovered_story_context = recovered_context
+            if topic_hint:
+                _remember_long_story_topic(state, topic_hint)
             _force_active_after_mode(state, "story", reason="long_story_mode")
-            if _is_story_continue_text(normalized):
+            if _is_story_continue_text(normalized) or generate_story_now:
                 return False
-            v6.speak("Long story mode on. I'll give richer stories when you ask.")
+            duration = _format_long_story_duration(target_minutes)
+            topic_part = f" about {topic_hint}" if topic_hint else ""
+            style_part = f" in {story_style} style" if story_style else ""
+            v6.speak("Long story mode on" + topic_part + style_part + (f" for about {duration}." if duration else ". I'll give richer stories when you ask."))
             return True
         if any(marker in normalized for marker in {"long explanation mode"}):
             _set_response_depth_mode(state, "long_explanation", "mode_command")
@@ -4472,12 +4783,20 @@ def _route_response_depth_mode(user_text: str, state: RobotRuntimeState) -> bool
         _set_response_length_context(state, "long_story")
         with state.lock:
             state.long_story_active = False
-            state.long_story_topic = None
+            state.long_story_topic = f"story: {topic_hint}" if topic_hint else None
             state.long_story_segment_index = 0
-            if state.conversation_mode in {"general", "wake_required"}:
+            state.long_story_target_minutes = target_minutes
+            state.long_story_style = story_style
+            state.recovered_story_context = recovered_context
+            if state.conversation_mode in {"general", "wake_required", "creative"}:
                 state.conversation_mode = "story"
+        if topic_hint:
+            _remember_long_story_topic(state, topic_hint)
         _force_active_after_mode(state, "story", reason="long_story_mode")
-        v6.speak("Long story mode on. I'll give richer stories when you ask.")
+        duration = _format_long_story_duration(target_minutes)
+        topic_part = f" about {topic_hint}" if topic_hint else ""
+        style_part = f" in {story_style} style" if story_style else ""
+        v6.speak("Long story mode on" + topic_part + style_part + (f" for about {duration}." if duration else ". I'll give richer stories when you ask."))
         return True
 
     if normalized in LONG_EXPLANATION_ACTIVATION_PHRASES:
@@ -4530,23 +4849,26 @@ def _voice_mode_command_action(user_text: str) -> tuple[str, str | None]:
         return "", None
     if _is_voice_modes_list_request(normalized):
         return "list", None
-    if any(phrase in normalized for phrase in {"natural voice", "use natural voice", "speak naturally"}):
-        return "set", "natural_voice"
     if any(
         phrase in normalized
         for phrase in {
-            "do you have a deep voice",
-            "can you use a deep voice",
-            "deep voice",
-            "use deep voice",
+            "natural voice",
+            "use natural voice",
+            "speak naturally",
             "robot voice",
             "use robot voice",
+            "deep voice",
+            "use deep voice",
+            "go to deep voice",
             "storyteller voice",
             "kid-friendly storyteller voice",
+            "story voice",
+            "use story voice",
             "friendly voice",
+            "use friendly voice",
         }
     ):
-        return "unsupported", None
+        return "set", None
     return "", None
 
 
@@ -4558,25 +4880,22 @@ def _route_voice_modes_local_reply(user_text: str, state: RobotRuntimeState) -> 
     _set_reply_context(state, "voice_command")
     _set_transient_response_length_context(state, "terse" if action == "set" else "normal")
     print(f"[V7.15 VOICE MODES] served_local=true action={action}")
-    if action == "set" and requested_mode == "natural_voice":
-        setter = getattr(robot_memory, "set_voice_mode", None)
-        if callable(setter):
+    if action == "set":
+        handler = getattr(robot_memory, "handle_voice_mode_command", None)
+        reply = None
+        if callable(handler):
             try:
-                setter("natural_voice")
+                reply = handler(user_text)
             except Exception as exc:
                 print("[V7.15 VOICE MODES] set warning:", exc)
-        v6.speak("Natural voice.")
-        return True
-    if action == "unsupported":
-        v6.speak(
-            f"My current voice is {current_voice}. Extra TTS voices like deep, robot, or storyteller voice "
-            "are still experimental unless Marquinho enables them."
-        )
+        if reply:
+            v6.speak(reply)
+            return True
+        v6.speak(f"My current voice mode is {_current_voice_mode()}.")
         return True
     v6.speak(
-        f"My current voice is {current_voice}. I can change response styles like normal, creative, "
-        "long story, and long explanation. Extra TTS voices like deep or robot voice are still experimental "
-        "unless Marquinho enables them."
+        f"My current voice is {current_voice}. I have five voice modes: robot voice, natural voice, "
+        "friendly voice, deep voice, and story voice."
     )
     return True
 
@@ -4659,9 +4978,14 @@ def _is_recent_conversation_topics_request(user_text: str) -> bool:
     phrases = {
         "recent topics",
         "previous topics",
+        "last topics",
         "what were our recent topics",
+        "what were our last topics",
         "what did we talk about",
         "what did we discuss",
+        "what did we talk about yesterday",
+        "what was our conversation yesterday",
+        "what was yesterday conversation",
         "list recent topics",
         "list previous topics",
         "conversation history",
@@ -4693,6 +5017,14 @@ def _is_conversation_log_analysis_request(user_text: str) -> bool:
             "summarize the conversation",
             "summarize previous log",
             "summarize previous conversation",
+            "research conversation",
+            "research the conversation",
+            "research our conversation",
+            "research yesterday conversation",
+            "research what was our conversation yesterday",
+            "what was our conversation yesterday",
+            "what did we talk about yesterday",
+            "what did we discuss yesterday",
             "what can we improve from the log",
             "any inappropriate topic",
         }
@@ -4712,6 +5044,31 @@ def _is_conversation_log_location_request(user_text: str) -> bool:
             "there is a log file",
             "where do you save logs",
             "where are conversation logs",
+        }
+    )
+
+
+def _is_conversation_log_recall_request(user_text: str) -> bool:
+    normalized = normalize_command_text(user_text)
+    if not normalized:
+        return False
+    return any(
+        phrase in normalized
+        for phrase in {
+            "do you remember what we talked",
+            "do you remember what was",
+            "remember yesterday",
+            "remember our conversation",
+            "recall yesterday",
+            "recall our conversation",
+            "what was our conversation yesterday",
+            "what did we talk about yesterday",
+            "what did we discuss yesterday",
+            "what were the last topics",
+            "what were our last topics",
+            "what were previous topics",
+            "what was the last conversation",
+            "what was our last conversation",
         }
     )
 
@@ -4743,23 +5100,13 @@ def _compact_logs_for_cloud(logs: list[dict], max_chars: int = 14000) -> str:
 
 def _analyze_conversation_logs_with_cloud(user_text: str, state: RobotRuntimeState) -> str:
     normalized = normalize_command_text(user_text)
-    previous_only = any(marker in normalized for marker in {"previous", "last log", "last interaction", "last conversation"})
     with state.lock:
         current_session_id = state.conversation_log_session_id
-    if previous_only:
-        candidates = [
-            log for log in robot_memory.list_conversation_logs(limit=8)
-            if log.get("session_id") != current_session_id and int(log.get("turn_count") or 0) > 0
-        ]
-        logs = [
-            {
-                "metadata": log,
-                "events": robot_memory._read_jsonl(Path(log["path"])),
-            }
-            for log in candidates[:3]
-        ]
-    else:
-        logs = robot_memory.load_conversation_log(limit=3)
+    logs = robot_memory.select_conversation_logs(
+        query=normalized,
+        current_session_id=current_session_id,
+        limit=3,
+    )
     if not logs:
         return "I do not have conversation logs yet."
     log_text = _compact_logs_for_cloud(logs)
@@ -4781,6 +5128,13 @@ def _analyze_conversation_logs_with_cloud(user_text: str, state: RobotRuntimeSta
 
 
 def _route_conversation_memory_local_reply(user_text: str, state: RobotRuntimeState) -> bool:
+    if _is_conversation_log_recall_request(user_text):
+        with state.lock:
+            current_session_id = state.conversation_log_session_id
+        _set_reply_context(state, "memory")
+        _set_transient_response_length_context(state, "normal")
+        v6.speak(robot_memory.format_conversation_log_recall(user_text, current_session_id=current_session_id, limit=3))
+        return True
     if _is_recent_conversation_topics_request(user_text):
         _set_reply_context(state, "memory")
         _set_transient_response_length_context(state, "normal")
@@ -4819,22 +5173,57 @@ def _extract_long_story_topic(user_text: str) -> str:
 
 def _is_long_mode_request(text: str) -> bool:
     normalized = normalize_command_text(text)
-    return normalized in LONG_STORY_ACTIVATION_PHRASES or any(
-        phrase in normalized
-        for phrase in {
-            "tell me a long story",
-            "tell me a bedtime story",
-            "tell me a long explanation",
-            "explain in detail for a long time",
-            "give me the full explanation",
-            "teach me this topic",
-        }
+    return (
+        (_extract_long_story_duration_minutes(text) > 0 and "story" in normalized)
+        or normalized in LONG_STORY_ACTIVATION_PHRASES
+        or any(
+            phrase in normalized
+            for phrase in {
+                "tell me a long story",
+                "tell me a bedtime story",
+                "tell me a long explanation",
+                "explain in detail for a long time",
+                "give me the full explanation",
+                "teach me this topic",
+            }
+        )
     )
 
 
 def _is_long_mode_continue(text: str) -> bool:
     normalized = normalize_command_text(text)
     return normalized in {"continue", "next part", "keep going", "go on", "continue the story"}
+
+
+def _is_story_generation_request(text: str) -> bool:
+    normalized = normalize_command_text(text)
+    if not normalized or "story" not in normalized:
+        return False
+    if _is_mode_command_not_physical(normalized) and not any(
+        phrase in normalized
+        for phrase in {
+            "tell a story",
+            "tell me a story",
+            "make a story",
+            "create a story",
+            "invent a story",
+        }
+    ):
+        return False
+    return any(
+        phrase in normalized
+        for phrase in {
+            "tell a story",
+            "tell me a story",
+            "make a story",
+            "create a story",
+            "invent a story",
+            "new story",
+            "another story",
+            "different story",
+            "start a new story",
+        }
+    ) or (_extract_long_story_duration_minutes(text) > 0 and not _is_mode_command_not_physical(normalized))
 
 
 def _long_story_segment(topic: str, segment_index: int, max_segments: int) -> str:
@@ -4869,8 +5258,11 @@ def _route_long_story_mode(user_text: str, state: RobotRuntimeState) -> bool:
         return True
 
     if _is_long_mode_request(user_text):
-        topic = _extract_long_story_topic(user_text)
+        topic = _extract_long_story_topic_hint(user_text) or _clean_story_topic(_extract_long_story_topic(user_text)) or "this story"
         narrative = any(phrase in normalized for phrase in {"story", "bedtime"})
+        target_minutes = _extract_long_story_duration_minutes(user_text)
+        story_style = _extract_story_style(user_text)
+        recovered_context = _recover_story_context_from_logs(user_text, state)
         _set_response_depth_mode(state, "long_story" if narrative else "long_explanation", "legacy_long_mode_request")
         _set_response_length_context(state, "long_story" if narrative else "detailed")
         _force_active_after_mode(state, "story" if narrative else "general", reason="long_mode")
@@ -4879,8 +5271,18 @@ def _route_long_story_mode(user_text: str, state: RobotRuntimeState) -> bool:
             state.long_story_topic = topic
             state.long_story_segment_index = 0
             state.long_story_max_segments = 0
+            state.long_story_target_minutes = target_minutes if narrative else 0
+            state.long_story_style = story_style if narrative else ""
+            state.recovered_story_context = recovered_context if narrative else ""
+        if narrative and topic and topic != "this story":
+            _remember_long_story_topic(state, topic)
+        if narrative and _is_story_generation_request(user_text):
+            return False
         if narrative:
-            v6.speak("Long story mode on. I'll give richer stories when you ask.")
+            duration = _format_long_story_duration(target_minutes)
+            topic_part = f" about {topic}" if topic and topic != "this story" else ""
+            style_part = f" in {story_style} style" if story_style else ""
+            v6.speak("Long story mode on" + topic_part + style_part + (f" for about {duration}." if duration else ". I'll give richer stories when you ask."))
         else:
             v6.speak("Long explanation mode on. I'll explain with more detail.")
         return True
@@ -5602,11 +6004,11 @@ def _route_project_local_reply(user_text: str, state: RobotRuntimeState) -> bool
         "what do you know about yourself",
         "can you repeat what are you",
     }:
-        v6.speak("I'm Miguel.")
+        v6.speak("I'm Miguel, Marquinho's voice-and-vision robot project. I can talk, listen, use the camera, remember topics, and help with robot experiments.")
         return True
 
     if normalized in {"are you a robot", "are you human", "are you a human", "are you a human or a robot"}:
-        v6.speak("Robot.")
+        v6.speak("I'm a robot project running on the Jetson, with voice, camera, memory, and cloud brain features.")
         return True
 
     if normalized == "which type of project is this":
@@ -6523,6 +6925,14 @@ def _route_identity_camera_intent(
     else:
         face_state = _fresh_identity_state_for_route(camera_manager, timeout_seconds=2.2)
         reply = _face_status_reply(face_state) if expanded_trigger else full.build_identity_reply(face_state)
+        if not face_state.get("recognized_person"):
+            with state.lock:
+                partner = _normalize_person_name(state.conversation_partner)
+            if partner and partner not in {"unknown", "unknown_wake_user"}:
+                if face_state.get("face_detected"):
+                    reply = f"I see a face, and our active conversation is with {_friendly_person_name(partner)}."
+                else:
+                    reply = f"I do not have a confirmed face right now, but our active conversation is with {_friendly_person_name(partner)}."
     _set_reply_context(state, "identity")
     v6.speak(reply)
     try:
@@ -7787,6 +8197,7 @@ def handle_queued_turn(
             if state.response_depth_mode == "normal":
                 state.response_depth_mode = "long_story"
             state.current_turn_latency["response_depth_mode"] = state.response_depth_mode
+            state.current_turn_latency["long_story_target_minutes"] = state.long_story_target_minutes
         _set_response_length_context(state, "long_story")
 
     _remember_accepted_turn(state, user_text)
@@ -7795,6 +8206,8 @@ def handle_queued_turn(
     _log_user_turn_event(state, user_text, route_hint="accepted", partner=partner)
 
     mode = _infer_conversation_mode(user_text)
+    with state.lock:
+        previous_conversation_mode = state.conversation_mode
     if is_conversation_active(state) and mode not in {"general", "robot_control"}:
         start_conversation_session(state, mode=mode, partner=partner, reason="mode_update")
     elif is_conversation_active(state):
@@ -8011,10 +8424,13 @@ def handle_queued_turn(
 
     cloud_prompt_text = _recover_contextual_followup_prompt(user_text, state)
     if new_story_requested:
-        story_theme = _extract_story_theme(user_text)
+        story_theme = _clean_story_topic(_extract_story_theme(user_text)) or _extract_long_story_topic_hint(user_text) or "new adventure"
+        story_style = _extract_story_style(user_text)
+        style_clause = f" Style: {story_style}." if story_style else ""
         cloud_prompt_text = (
             f"Start a new complete story with this theme: {story_theme}. "
             "If the theme is vague, invent the full premise, characters, problem, obstacle, and ending. "
+            f"{style_clause} "
             f"User request: {user_text}"
         )
     recovered_context = cloud_prompt_text != user_text
@@ -8108,6 +8524,9 @@ def handle_queued_turn(
         cloud_conversation_mode = state.conversation_mode
         cloud_depth_mode = state.response_depth_mode
         cloud_allowed_languages = list(state.allowed_conversation_languages or ["english"])
+        cloud_long_story_target_minutes = state.long_story_target_minutes
+        cloud_story_style = state.long_story_style
+        cloud_recovered_story_context = state.recovered_story_context
     cloud_route = "creative" if creative_fast_topic or cloud_conversation_mode in {"creative", "story"} else "normal"
     _set_reply_context(state, cloud_route)
     active_topic_label = _topic_log_label(_current_active_topic(state))
@@ -8119,6 +8538,9 @@ def handle_queued_turn(
         response_depth_mode=cloud_depth_mode,
         active_topic=active_topic_label,
         allowed_languages=cloud_allowed_languages,
+        long_story_target_minutes=cloud_long_story_target_minutes,
+        story_style=cloud_story_style,
+        recovered_story_context=cloud_recovered_story_context,
     )
     cloud_user_text += _live_conversation_context_for_cloud(state)
     face_state = _neutral_conversation_face_state()
@@ -8160,6 +8582,10 @@ def speech_worker(
                 with state.lock:
                     conversation_mode = state.conversation_mode
                     last_user_text = state.last_user_text
+                    state_long_story_target_minutes = state.long_story_target_minutes
+                long_story_target_minutes = int(
+                    latency.get("long_story_target_minutes") or state_long_story_target_minutes or 0
+                )
                 if (
                     response_length_mode == "terse"
                     and conversation_mode in {"general", "creative", "story", "project", "owner_password"}
@@ -8177,9 +8603,16 @@ def speech_worker(
                     and _long_story_depth_applies_to_route(route, last_user_text, conversation_mode)
                     and response_length_mode != "terse"
                 ):
-                    max_words = 250 if _is_explicit_long_story_request(last_user_text) else 180
-                    max_words = max(120 if _is_explicit_long_story_request(last_user_text) else 80, max_words)
-                    print(f"[V7.15 LENGTH] depth=long_story allowed_words={max_words}")
+                    duration_words = _long_story_target_words(long_story_target_minutes)
+                    if duration_words:
+                        max_words = duration_words
+                    else:
+                        max_words = 250 if _is_explicit_long_story_request(last_user_text) else 180
+                        max_words = max(120 if _is_explicit_long_story_request(last_user_text) else 80, max_words)
+                    print(
+                        f"[V7.15 LENGTH] depth=long_story allowed_words={max_words} "
+                        f"target_minutes={long_story_target_minutes}"
+                    )
                 elif response_depth_mode == "long_story":
                     print(f"[V7.15 LENGTH] depth=long_story ignored_for_route={route}")
                     if response_length_mode == "long_story":

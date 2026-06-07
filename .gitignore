@@ -52,3 +52,16 @@ week3/models/
 
 # Separate nested repo for modular Miguel core development
 miguel_core_lab/
+
+# HiWonder / MentorPi extracted dumps - do not commit
+hiwonder_code_extract/
+hiwonder_sdcard_dump/
+mentorpi_container_extract/
+
+# Audio runtime files
+week3/audio/*.wav
+
+# Python/cache/runtime noise
+__pycache__/
+*.pyc
+.env

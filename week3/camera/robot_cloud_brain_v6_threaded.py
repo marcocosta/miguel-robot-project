@@ -49,9 +49,11 @@ FRAME_W = 640
 FRAME_H = 480
 FACE_SIZE = 160
 
-# Stable ALSA names. These avoid changing card numbers after reboot.
-MIC_DEVICE = "hw:CARD=Array,DEV=0"          # ReSpeaker XVF3800
-SPEAKER_DEVICE = "plughw:CARD=Audio,DEV=0" # USB-C/3.5mm adapter / Creative speaker
+# Audio device names. PulseAudio keeps USB audio stable even when ALSA card numbers move.
+MIC_DEVICE = os.getenv("MIGUEL_MIC_DEVICE", "hw:CARD=Array,DEV=0")
+PULSE_SOURCE = os.getenv("MIGUEL_PULSE_SOURCE", "")
+SPEAKER_DEVICE = os.getenv("MIGUEL_SPEAKER_DEVICE", "pulse")
+PULSE_SINK = os.getenv("MIGUEL_PULSE_SINK", "")
 
 AUDIO_RATE = 16000
 AUDIO_CHANNELS = 2
@@ -221,7 +223,55 @@ def speak_with_espeak(speech_text: str):
         ["espeak", "-s", "145", "-p", "42", "-a", "135", "-w", str(wav_path), speech_text],
         check=True,
     )
-    subprocess.run(["aplay", "-q", "-D", SPEAKER_DEVICE, str(wav_path)], check=True)
+    play_audio_file(wav_path)
+
+
+def _audio_playback_env():
+    env = os.environ.copy()
+    if SPEAKER_DEVICE == "pulse" and PULSE_SINK:
+        env["PULSE_SINK"] = PULSE_SINK
+    return env
+
+
+def play_audio_file(wav_path, check=True):
+    subprocess.run(
+        ["aplay", "-q", "-D", SPEAKER_DEVICE, str(wav_path)],
+        check=check,
+        env=_audio_playback_env(),
+    )
+
+
+def prepare_speech_audio(text: str):
+    speech_text = clean_text_for_speech(text)
+    if not speech_text:
+        return None
+
+    cfg = get_tts_config_for_voice_mode()
+    if cfg.get("engine") == "espeak" or MIGUEL_TTS_ENGINE.lower() != "openai":
+        wav_path = Path(tempfile.gettempdir()) / "miguel_speech.wav"
+        subprocess.run(
+            ["espeak", "-s", "145", "-p", "42", "-a", "135", "-w", str(wav_path), speech_text],
+            check=True,
+        )
+        return {"text": text, "speech_text": speech_text, "wav_path": str(wav_path)}
+
+    wav_path = Path(tempfile.gettempdir()) / "miguel_speech_openai.wav"
+    response = client.audio.speech.create(
+        model=MIGUEL_TTS_MODEL,
+        voice=cfg.get("voice", "cedar"),
+        input=speech_text,
+        instructions=cfg.get("instructions"),
+        response_format="wav",
+    )
+    response.write_to_file(str(wav_path))
+    return {"text": text, "speech_text": speech_text, "wav_path": str(wav_path)}
+
+
+def play_prepared_speech(prepared):
+    if not prepared:
+        return
+    print(f"{ROBOT_NAME} says: {prepared.get('text', '')}")
+    play_audio_file(prepared["wav_path"])
 
 
 def speak_with_openai_tts(speech_text: str):
@@ -241,28 +291,19 @@ def speak_with_openai_tts(speech_text: str):
     )
 
     response.write_to_file(str(wav_path))
-    subprocess.run(["aplay", "-q", "-D", SPEAKER_DEVICE, str(wav_path)], check=True)
+    play_audio_file(wav_path)
 
 def speak(text: str):
-    print(f"{ROBOT_NAME} says: {text}")
-
-    speech_text = clean_text_for_speech(text)
-    if not speech_text:
-        return
-
     try:
-        cfg = get_tts_config_for_voice_mode()
-
-        if cfg.get("engine") == "espeak":
-            speak_with_espeak(speech_text)
-        elif MIGUEL_TTS_ENGINE.lower() == "openai":
-            speak_with_openai_tts(speech_text)
-        else:
-            speak_with_espeak(speech_text)
+        prepared = prepare_speech_audio(text)
+        play_prepared_speech(prepared)
 
     except Exception as e:
         print("[TTS] Voice failed; falling back to espeak:", e)
-        speak_with_espeak(speech_text)
+        speech_text = clean_text_for_speech(text)
+        if speech_text:
+            print(f"{ROBOT_NAME} says: {text}")
+            speak_with_espeak(speech_text)
 
 def open_raw_mic_stream():
     cmd = [
@@ -275,10 +316,15 @@ def open_raw_mic_stream():
         "-t", "raw",
     ]
 
+    env = os.environ.copy()
+    if MIC_DEVICE == "pulse" and PULSE_SOURCE:
+        env["PULSE_SOURCE"] = PULSE_SOURCE
+
     return subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
+        env=env,
     )
 
 
@@ -1902,6 +1948,27 @@ def handle_user_turn_with_cached_state(user_text, cached_local_state):
     local_state = sanitize_camera_memory_state(cached_local_state)
     print("[BRAIN] Using cached local state:", local_state)
 
+    v7_cloud_augmented_turn = any(
+        marker in user_text
+        for marker in (
+            "\nMiguel response length instruction:",
+            "\nMiguel creative instruction:",
+            "\nMiguel long story instruction:",
+            "\nMiguel live conversation context:",
+        )
+    )
+    if v7_cloud_augmented_turn:
+        try:
+            reply = ask_cloud_brain(user_text, local_state)
+        except Exception as e:
+            print("[BRAIN] OpenAI API error:", e)
+            reply = "My cloud brain is not reachable right now, but my local systems are still online."
+
+        reply = safe_reply_after_camera_firewall(reply, local_state)
+        speak(reply)
+        update_conversation_memory(assistant_reply=reply)
+        return True
+
     mode_reply = handle_robot_mode_command(user_text, local_state.get("recognized_person"))
     if mode_reply == "__SILENT__":
         print("[MODE] Sleep mode: silently ignored user text.")
@@ -2088,7 +2155,7 @@ def ready_beep():
                 value = int(32767 * volume * fade * _math.sin(2 * _math.pi * frequency * t))
                 wf.writeframes(_struct.pack("<h", value))
 
-        subprocess.run(["aplay", "-q", "-D", SPEAKER_DEVICE, str(beep_path)], check=False)
+        play_audio_file(beep_path, check=False)
 
     except Exception as e:
         print("[BEEP] Could not play ready beep:", e)

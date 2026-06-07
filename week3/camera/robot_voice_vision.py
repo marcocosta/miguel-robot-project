@@ -1,6 +1,7 @@
 import cv2
 import depthai as dai
 import json
+import os
 import subprocess
 import tempfile
 import wave
@@ -11,7 +12,8 @@ FRAME_W = 640
 FRAME_H = 480
 
 MIC_DEVICE = "hw:CARD=Array,DEV=0"  # ReSpeaker XVF3800
-SPEAKER_DEVICE = "plughw:CARD=Audio,DEV=0"  # USB audio adapter / Creative speaker
+SPEAKER_DEVICE = os.getenv("MIGUEL_SPEAKER_DEVICE", "pulse")
+PULSE_SINK = os.getenv("MIGUEL_PULSE_SINK", "")
 
 BASE = Path.home() / "robot-project/week3"
 AUDIO_DIR = BASE / "audio"
@@ -34,7 +36,10 @@ def speak(text: str):
     print(f"Robot says: {text}")
     wav_path = Path(tempfile.gettempdir()) / "robot_speech.wav"
     subprocess.run(["espeak", "-w", str(wav_path), text], check=True)
-    subprocess.run(["aplay", "-D", SPEAKER_DEVICE, str(wav_path)], check=True)
+    env = os.environ.copy()
+    if SPEAKER_DEVICE == "pulse" and PULSE_SINK:
+        env["PULSE_SINK"] = PULSE_SINK
+    subprocess.run(["aplay", "-D", SPEAKER_DEVICE, str(wav_path)], check=True, env=env)
 
 def record_command(seconds=4):
     stereo_path = AUDIO_DIR / "voice_command_stereo.wav"
