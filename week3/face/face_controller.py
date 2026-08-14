@@ -24,6 +24,13 @@ class FaceController:
         "shutdown",
         "confirm",
         "error",
+        "normal",
+        "happy",
+        "angry",
+        "sad",
+        "scared",
+        "concerned",
+        "motivated",
     }
     SUPPORTED_STATUSES = supported_statuses
 
@@ -83,6 +90,19 @@ class FaceController:
             return
         self.set_mode(FaceMode.HAPPY, text)
 
+    def expression(self, name: str, text: Optional[str] = None) -> None:
+        expression_name = str(name or "normal").strip().lower()
+        mode = {
+            "normal": FaceMode.IDLE,
+            "happy": FaceMode.HAPPY,
+            "angry": FaceMode.ANGRY,
+            "sad": FaceMode.SAD,
+            "scared": FaceMode.SCARED,
+            "concerned": FaceMode.CONCERNED,
+            "motivated": FaceMode.MOTIVATED,
+        }.get(expression_name, FaceMode.IDLE)
+        self.set_mode(mode, text or expression_name.title())
+
     def confused(self, text: str = "Confused") -> None:
         self.set_mode(FaceMode.CONFUSED, text)
 
@@ -111,6 +131,13 @@ class FaceController:
             "shutdown": FaceMode.CONFIRM,
             "confirm": FaceMode.CONFIRM,
             "error": FaceMode.ERROR,
+            "normal": FaceMode.IDLE,
+            "happy": FaceMode.HAPPY,
+            "angry": FaceMode.ANGRY,
+            "sad": FaceMode.SAD,
+            "scared": FaceMode.SCARED,
+            "concerned": FaceMode.CONCERNED,
+            "motivated": FaceMode.MOTIVATED,
         }.get(state_name, FaceMode.IDLE)
 
         if state_name == "wake_required":

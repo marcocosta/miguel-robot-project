@@ -8,9 +8,13 @@ Policy:
 - Conversation identity must never be treated as camera evidence.
 """
 
+import unicodedata
+
 
 def normalize_text(user_text: str) -> str:
-    return str(user_text or "").lower().strip()
+    text = unicodedata.normalize("NFKD", str(user_text or "").lower())
+    text = "".join(char for char in text if not unicodedata.combining(char))
+    return " ".join(text.strip().split())
 
 
 def is_identity_camera_request(user_text: str) -> bool:
@@ -19,6 +23,32 @@ def is_identity_camera_request(user_text: str) -> bool:
     Includes imperfect ASR variants like "who you see".
     """
     text = normalize_text(user_text)
+
+    # A mention of an earlier recognition event can be part of a privacy or
+    # project question, rather than a request to identify the current frame.
+    retrospective_markers = (
+        "que voce me reconheceu",
+        "quando voce me reconheceu",
+        "como voce me reconheceu",
+        "you recognized me",
+        "when you recognized me",
+        "how you recognized me",
+    )
+    explanatory_markers = (
+        "essas imagens",
+        "as imagens",
+        "minhas imagens",
+        "my images",
+        "these images",
+        "where are the images",
+        "onde ficam as imagens",
+        "o que acontece com",
+        "what happens to",
+    )
+    if any(marker in text for marker in retrospective_markers) and (
+        any(marker in text for marker in explanatory_markers) or len(text.split()) >= 14
+    ):
+        return False
 
     phrases = [
         "can you see me",
@@ -50,11 +80,19 @@ def is_identity_camera_request(user_text: str) -> bool:
         "who is in front",
         "who is in front of you",
         "who is in front of the camera",
+        "person in front of the board",
+        "person in front of board",
         "who is in the frame",
         "who are in the frame",
         "who am i",
         "do you recognize me",
         "do you recognise me",
+        "do you recognize this person",
+        "do you recognise this person",
+        "recognize this person",
+        "recognise this person",
+        "recognize that person",
+        "recognise that person",
         "do you recognize us",
         "do you recognise us",
         "recognize us",
@@ -84,6 +122,21 @@ def is_identity_camera_request(user_text: str) -> bool:
         "can you see marquinho",
         "can you see marquinho in the back",
         "can you see marco in the back",
+        "voce consegue me ver",
+        "consegue me ver",
+        "voce pode me ver",
+        "voce me ve",
+        "quem voce ve",
+        "quem voce esta vendo",
+        "quem esta ai",
+        "quem esta na sua frente",
+        "quem esta na camera",
+        "quem esta no quadro",
+        "quem sou eu",
+        "voce me reconhece",
+        "voce reconhece a gente",
+        "reconheca meu rosto",
+        "identifique meu rosto",
     ]
 
     return any(p in text for p in phrases)
@@ -110,6 +163,7 @@ def is_scene_camera_request(user_text: str) -> bool:
         "describe the scene",
         "what do you see",
         "what can you see",
+        "what you can see",
         "what are you seeing",
         "do you see",
         "can you see",
@@ -119,12 +173,25 @@ def is_scene_camera_request(user_text: str) -> bool:
         "what's in front of you",
         "what is in front of the camera",
         "what's in front of the camera",
+        "what is this object",
+        "what's this object",
+        "what is that object",
+        "what's that object",
+        "what is the object",
+        "what object is this",
+        "describe the object",
+        "object in front of you",
+        "object that i am holding",
+        "object that im holding",
+        "object that i'm holding",
+        "holding in front of you",
         "look around",
         "look and tell me",
         "check out your camera",
         "check your camera",
         "check your camera again",
         "refresh your camera",
+        "flash your camera",
         "camera view",
         "your view",
         "what is there",
@@ -140,6 +207,19 @@ def is_scene_camera_request(user_text: str) -> bool:
         "is your vision blocked",
         "black board",
         "blocked camera",
+        "descreva o que voce esta vendo",
+        "descreva o que voce ve",
+        "descreva sua camera",
+        "descreva a cena",
+        "o que voce esta vendo",
+        "o que voce ve",
+        "mostre o que voce esta vendo",
+        "mostre o que voce ve",
+        "olhe ao redor",
+        "olha ao redor",
+        "verifique sua camera",
+        "atualize sua camera",
+        "a camera esta bloqueada",
     ]
 
     return any(p in text for p in phrases)
@@ -158,6 +238,7 @@ def is_any_camera_request(user_text: str) -> bool:
     phrases = [
         "what do you see",
         "what can you see",
+        "what you can see",
         "what are you seeing",
         "do you see",
         "can you see",
@@ -167,8 +248,22 @@ def is_any_camera_request(user_text: str) -> bool:
         "check out your camera",
         "check your camera",
         "check your camera again",
+        "refresh your camera",
+        "flash your camera",
         "describe what you see",
         "describe what you are seeing",
+        "what is this object",
+        "what's this object",
+        "what is that object",
+        "what's that object",
+        "what is the object",
+        "what object is this",
+        "describe the object",
+        "object in front of you",
+        "object that i am holding",
+        "object that im holding",
+        "object that i'm holding",
+        "holding in front of you",
         "who do you see",
         "who can you see",
         "who you see",
@@ -196,6 +291,10 @@ def is_any_camera_request(user_text: str) -> bool:
         "anybody behind me",
         "recognize me",
         "recognise me",
+        "recognize this person",
+        "recognise this person",
+        "person in front of the board",
+        "person in front of board",
         "recognize us",
         "recognise us",
         "identify me",
@@ -207,6 +306,20 @@ def is_any_camera_request(user_text: str) -> bool:
         "what are those two people doing",
         "what are they doing",
         "blocked camera",
+        "voce consegue me ver",
+        "consegue me ver",
+        "quem voce ve",
+        "quem voce esta vendo",
+        "voce me reconhece",
+        "descreva o que voce esta vendo",
+        "descreva o que voce ve",
+        "o que voce esta vendo",
+        "o que voce ve",
+        "mostre o que voce esta vendo",
+        "mostre o que voce ve",
+        "olhe ao redor",
+        "olha ao redor",
+        "verifique sua camera",
     ]
 
     return any(p in text for p in phrases)
@@ -263,6 +376,38 @@ def classify_camera_intent(user_text: str) -> str:
     text = normalize_text(user_text)
 
     if _is_descriptive_visual_statement(text):
+        return "none"
+
+    # The same retrospective privacy/project question may also contain a
+    # broad scene phrase such as "imagens que voce ve".  Suppress all live
+    # camera routing for that compound turn, not only identity routing.
+    if any(
+        marker in text
+        for marker in {
+            "que voce me reconheceu",
+            "quando voce me reconheceu",
+            "como voce me reconheceu",
+            "you recognized me",
+            "when you recognized me",
+            "how you recognized me",
+        }
+    ) and (
+        any(
+            marker in text
+            for marker in {
+                "essas imagens",
+                "as imagens",
+                "minhas imagens",
+                "my images",
+                "these images",
+                "where are the images",
+                "onde ficam as imagens",
+                "o que acontece com",
+                "what happens to",
+            }
+        )
+        or len(text.split()) >= 14
+    ):
         return "none"
 
     if is_identity_camera_request(text):

@@ -15,7 +15,7 @@ CONVERSATION_LOG_MAX_BYTES = 200 * 1024 * 1024
 DEFAULT_MEMORY = {
     "memory_schema_version": 2,
     "robot_mode": "normal",
-    "personality_mode": "mission_control",
+    "personality_mode": "normal",
     "enrollment_unlock": {"active": False, "authorized_by": None, "expires_at": 0},
     "voice_mode": "natural_voice",
     "pending_shutdown": False,
@@ -353,7 +353,7 @@ def set_robot_mode(mode):
 
 
 def get_personality_mode():
-    return load_memory().get("personality_mode", "mission_control")
+    return load_memory().get("personality_mode", "normal")
 
 
 def set_personality_mode(mode):
@@ -719,7 +719,7 @@ def get_memory_context(person=None):
 
     return {
         "robot_mode": memory.get("robot_mode", "normal"),
-        "personality_mode": memory.get("personality_mode", "mission_control"),
+        "personality_mode": memory.get("personality_mode", "normal"),
         "voice_mode": memory.get("voice_mode", "robot_voice"),
         "voice_mode": memory.get("voice_mode", "natural_robot"),
         "profile": profile,
@@ -941,6 +941,9 @@ def handle_voice_mode_command(user_text):
                 "use natural voice",
                 "more natural voice",
                 "speak naturally",
+                "voz natural",
+                "voz para natural",
+                "falar naturalmente",
                 "normal voice",
                 "startup voice",
                 "start voice",
@@ -1157,8 +1160,8 @@ def handle_robot_mode_command(user_text, recognized_person=None):
         "technical mode": "engineer",
         "mission control mode": "mission_control",
         "quiet mode": "quiet",
-        "normal mode": "mission_control",
-        "default mode": "mission_control",
+        "normal mode": "normal",
+        "default mode": "normal",
     }
 
     for phrase, mode in mode_map.items():
@@ -1174,6 +1177,8 @@ def handle_robot_mode_command(user_text, recognized_person=None):
                 return "Engineer mode activated. I will be more technical and precise."
             if mode == "quiet":
                 return "Quiet mode activated. I will keep answers shorter."
+            if mode == "normal":
+                return "Normal conversation mode activated."
             return "Mission Control mode activated."
 
     # Profile memory commands.
@@ -1214,7 +1219,7 @@ def handle_robot_mode_command(user_text, recognized_person=None):
     if "what mode are you in" in text or "current mode" in text:
         return (
             f"Robot mode is {memory.get('robot_mode', 'normal')}. "
-            f"Personality mode is {memory.get('personality_mode', 'mission_control')}."
+            f"Personality mode is {memory.get('personality_mode', 'normal')}."
         )
 
     return None

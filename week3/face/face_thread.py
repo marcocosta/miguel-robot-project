@@ -136,6 +136,16 @@ class FaceThread:
             return (255, 190, 80)
         if mode == FaceMode.HAPPY:
             return (255, 220, 100)
+        if mode == FaceMode.ANGRY:
+            return (255, 95, 70)
+        if mode == FaceMode.SAD:
+            return (90, 155, 255)
+        if mode == FaceMode.SCARED:
+            return (220, 170, 255)
+        if mode == FaceMode.CONCERNED:
+            return (255, 175, 90)
+        if mode == FaceMode.MOTIVATED:
+            return (90, 255, 145)
         if mode == FaceMode.CONFUSED:
             return (255, 170, 80)
         return (120, 220, 255)
@@ -167,6 +177,18 @@ class FaceThread:
 
         if mode == FaceMode.HAPPY:
             eye_h = max(18, int(55 * blink))
+        elif mode in {FaceMode.ANGRY, FaceMode.SAD}:
+            eye_h = max(18, int(70 * blink))
+            wobble_y += 8
+        elif mode == FaceMode.SCARED:
+            eye_w = 165
+            eye_h = max(25, int(120 * blink))
+        elif mode == FaceMode.CONCERNED:
+            eye_w = 150
+            eye_h = max(20, int(78 * blink))
+        elif mode == FaceMode.MOTIVATED:
+            eye_w = 155
+            eye_h = max(20, int(82 * blink))
 
         if mode == FaceMode.LISTENING:
             eye_w = 155
@@ -178,6 +200,34 @@ class FaceThread:
 
         self._draw_glow_oval(screen, left_x + wobble_x, center_y + wobble_y, eye_w, eye_h, color)
         self._draw_glow_oval(screen, right_x + wobble_x, center_y + wobble_y, eye_w, eye_h, color)
+
+        brow_y = center_y - eye_h // 2 - 30
+        if mode == FaceMode.ANGRY:
+            # Preserve the original sad-face brow geometry, whose lowered
+            # inner corners read clearly as anger.
+            pygame.draw.line(screen, color, (left_x - 70, brow_y - 12), (left_x + 65, brow_y + 15), 12)
+            pygame.draw.line(screen, color, (right_x - 65, brow_y + 15), (right_x + 70, brow_y - 12), 12)
+        elif mode == FaceMode.SAD:
+            # Sadness raises the inner brow and lets the outer brow fall. Two
+            # segments give each brow a softer, worried arch instead of the
+            # hard inward V used by anger.
+            pygame.draw.line(screen, color, (left_x - 72, brow_y + 12), (left_x + 25, brow_y - 17), 11)
+            pygame.draw.line(screen, color, (left_x + 25, brow_y - 17), (left_x + 66, brow_y - 10), 11)
+            pygame.draw.line(screen, color, (right_x - 66, brow_y - 10), (right_x - 25, brow_y - 17), 11)
+            pygame.draw.line(screen, color, (right_x - 25, brow_y - 17), (right_x + 72, brow_y + 12), 11)
+
+            # Small tear trails reinforce sadness without turning the face
+            # into the wide-eyed scared expression.
+            tear_color = (125, 195, 255)
+            tear_y = center_y + eye_h // 2 + 8
+            pygame.draw.line(screen, tear_color, (left_x + 42, tear_y), (left_x + 38, tear_y + 28), 7)
+            pygame.draw.line(screen, tear_color, (right_x - 42, tear_y), (right_x - 38, tear_y + 28), 7)
+        elif mode in {FaceMode.CONCERNED, FaceMode.SCARED}:
+            pygame.draw.line(screen, color, (left_x - 70, brow_y + 8), (left_x + 65, brow_y - 12), 12)
+            pygame.draw.line(screen, color, (right_x - 65, brow_y - 12), (right_x + 70, brow_y + 8), 12)
+        elif mode == FaceMode.MOTIVATED:
+            pygame.draw.line(screen, color, (left_x - 70, brow_y - 8), (left_x + 65, brow_y + 6), 12)
+            pygame.draw.line(screen, color, (right_x - 65, brow_y + 6), (right_x + 70, brow_y - 8), 12)
 
     def _draw_mouth(
         self,
@@ -194,9 +244,22 @@ class FaceThread:
             level = max(self.state.mouth_level, loop_level * 0.75)
             mouth_h = int(20 + level * 65)
             mouth_w = 190
-        elif mode == FaceMode.HAPPY:
-            mouth_w = 210
-            mouth_h = 34
+        elif mode in {FaceMode.HAPPY, FaceMode.MOTIVATED}:
+            mouth_w = 220 if mode == FaceMode.MOTIVATED else 210
+            mouth_h = 70
+            rect = pygame.Rect(mouth_x - mouth_w // 2, mouth_y - mouth_h, mouth_w, mouth_h)
+            pygame.draw.arc(screen, color, rect, math.radians(190), math.radians(350), 16)
+            return
+        elif mode in {FaceMode.ANGRY, FaceMode.SAD, FaceMode.CONCERNED}:
+            mouth_w = 170 if mode in {FaceMode.ANGRY, FaceMode.SAD} else 125
+            mouth_h = 70 if mode == FaceMode.SAD else 58
+            rect = pygame.Rect(mouth_x - mouth_w // 2, mouth_y, mouth_w, mouth_h)
+            line_width = 12 if mode == FaceMode.SAD else 14
+            pygame.draw.arc(screen, color, rect, math.radians(10), math.radians(170), line_width)
+            return
+        elif mode == FaceMode.SCARED:
+            pygame.draw.ellipse(screen, color, pygame.Rect(mouth_x - 43, mouth_y - 47, 86, 94), 12)
+            return
         elif mode == FaceMode.CONFUSED:
             mouth_w = 120
             mouth_h = 18
@@ -274,6 +337,11 @@ class FaceThread:
             FaceMode.ERROR: "ERROR",
             FaceMode.CONFUSED: "CONFUSED",
             FaceMode.HAPPY: "READY",
+            FaceMode.ANGRY: "ANGRY",
+            FaceMode.SAD: "SAD",
+            FaceMode.SCARED: "SCARED",
+            FaceMode.CONCERNED: "CONCERNED",
+            FaceMode.MOTIVATED: "MOTIVATED",
         }.get(mode, mode.value.upper())
 
         dot_x = int(self.width * 0.08)
