@@ -2635,7 +2635,21 @@ def _first_sentence(text: str) -> str:
     return parts[0].strip() if parts and parts[0].strip() else str(text or "").strip()
 
 
-TRAILING_WEAK_WORDS = {"and", "or", "but", "in", "how", "with", "to", "of", "about"}
+TRAILING_WEAK_WORDS = {
+    "a",
+    "an",
+    "and",
+    "but",
+    "how",
+    "i",
+    "in",
+    "of",
+    "or",
+    "the",
+    "to",
+    "with",
+    "about",
+}
 
 
 def _word_len(text: str) -> int:
@@ -2682,14 +2696,29 @@ def trim_to_word_limit_preserve_sentence(text: str, max_words: int) -> str:
             print(f"[V7.14 LENGTH] trimmed mode=unknown words_before={words_before} words_after={_word_len(candidate)}")
             return candidate
 
+    # If the first sentence alone exceeds the spoken cap, prefer ending at a
+    # clause boundary.  A raw word slice produced audible fragments in the
+    # runtime log (for example, "I..." and "a lower...").
     words = original.split()
+    capped = " ".join(words[:max_words])
+    clause_ends = [match.end() for match in re.finditer(r"[,;:]|\s+[—–-]\s+", capped)]
+    for clause_end in reversed(clause_ends):
+        clause = capped[:clause_end].rstrip(" ,;:—–-")
+        if _word_len(clause) >= max(4, int(max_words * 0.45)) and not _ends_with_weak_trailing_word(clause):
+            trimmed = clause.rstrip(".!?") + "."
+            print(
+                f"[V7.14 LENGTH] trimmed mode=unknown words_before={words_before} "
+                f"words_after={_word_len(trimmed)} boundary=clause"
+            )
+            return trimmed
+
     candidate_words = words[:max_words]
     while candidate_words and re.sub(r"[^a-zA-Z']+", "", candidate_words[-1]).lower() in TRAILING_WEAK_WORDS:
         candidate_words.pop()
     candidate = " ".join(candidate_words).rstrip(" ,;:")
     if not candidate:
         candidate = " ".join(words[:max_words]).rstrip(" ,;:")
-    trimmed = candidate.rstrip(".!?") + "..."
+    trimmed = candidate.rstrip(".!?") + "."
     print(f"[V7.14 LENGTH] trimmed mode=unknown words_before={words_before} words_after={_word_len(trimmed)}")
     return trimmed
 
@@ -6342,6 +6371,8 @@ def _voice_mode_command_action(user_text: str) -> tuple[str, str | None]:
         return "", None
     if _is_voice_modes_list_request(normalized):
         return "list", None
+    if "angry voice" in normalized:
+        return "unsupported_angry", None
     if any(
         phrase in normalized
         for phrase in {
@@ -6376,6 +6407,18 @@ def _route_voice_modes_local_reply(user_text: str, state: RobotRuntimeState) -> 
     _set_reply_context(state, "voice_command")
     _set_transient_response_length_context(state, "terse" if action == "set" else "normal")
     print(f"[V7.15 VOICE MODES] served_local=true action={action}")
+    if action == "unsupported_angry":
+        if any(marker in normalize_command_text(user_text) for marker in {"example", "sound", "sounds"}):
+            v6.speak(
+                "I do not have an angry voice mode. An acted angry voice would sound sharper and more forceful, "
+                "but I would keep it pretend and safe."
+            )
+        else:
+            v6.speak(
+                "I have an angry face expression, but no angry voice mode. "
+                "My voice modes are natural, robot, friendly, deep, and story."
+            )
+        return True
     if action == "set":
         handler = getattr(robot_memory, "handle_voice_mode_command", None)
         reply = None
