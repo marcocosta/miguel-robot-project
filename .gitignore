@@ -27,6 +27,7 @@ node_modules/
 *.log
 logs/
 week3/logs/
+week3/debug_handoffs/
 
 # Debug/generated images
 debug_snapshots/
@@ -65,3 +66,6 @@ week3/audio/*.wav
 __pycache__/
 *.pyc
 .env
+
+# Generated TTS cache
+week3/audio/tts_cache/

@@ -1,8 +1,10 @@
 import cv2
 import depthai as dai
+import hashlib
 import json
 import os
 import base64
+from collections import deque
 import re
 import subprocess
 import tempfile
@@ -11,6 +13,7 @@ import threading
 import wave
 import numpy as np
 from pathlib import Path
+from dual_respeaker import DualMicStream, adaptive_rms_threshold, strongest_stereo_channel
 
 try:
     from v7.camera_intents import is_scene_camera_request as v7_is_scene_camera_request
@@ -52,16 +55,24 @@ FACE_SIZE = 160
 # Audio device names. PulseAudio keeps USB audio stable even when ALSA card numbers move.
 MIC_DEVICE = os.getenv("MIGUEL_MIC_DEVICE", "hw:CARD=Array,DEV=0")
 PULSE_SOURCE = os.getenv("MIGUEL_PULSE_SOURCE", "")
+PULSE_SOURCE_SECONDARY = os.getenv("MIGUEL_PULSE_SOURCE_SECONDARY", "")
 SPEAKER_DEVICE = os.getenv("MIGUEL_SPEAKER_DEVICE", "pulse")
 PULSE_SINK = os.getenv("MIGUEL_PULSE_SINK", "")
 
 AUDIO_RATE = 16000
 AUDIO_CHANNELS = 2
-CHUNK_MS = 250
+CHUNK_MS = max(40, int(os.getenv("MIGUEL_AUDIO_CHUNK_MS", "100")))
 CHUNK_BYTES = int(AUDIO_RATE * AUDIO_CHANNELS * 2 * (CHUNK_MS / 1000.0))
 
 SPEECH_RMS_THRESHOLD = 1200
-SILENCE_SECONDS = 1.8
+SPEECH_RMS_MIN_THRESHOLD = max(250.0, float(os.getenv("MIGUEL_SPEECH_RMS_MIN_THRESHOLD", "500")))
+SPEECH_NOISE_MULTIPLIER = max(1.5, float(os.getenv("MIGUEL_SPEECH_NOISE_MULTIPLIER", "3.0")))
+SPEECH_PREROLL_SECONDS = max(0.0, float(os.getenv("MIGUEL_SPEECH_PREROLL_SECONDS", "0.4")))
+SILENCE_SECONDS = max(0.4, float(os.getenv("MIGUEL_ENDPOINT_SILENCE_SECONDS", "0.9")))
+SHORT_UTTERANCE_SILENCE_SECONDS = max(
+    SILENCE_SECONDS,
+    float(os.getenv("MIGUEL_SHORT_UTTERANCE_SILENCE_SECONDS", "1.05")),
+)
 MIN_TURN_SECONDS = 1.0
 MAX_TURN_SECONDS = 20.0
 
@@ -95,6 +106,8 @@ MODEL_PATH = BASE / "models/vosk-model-small-en-us-0.15"
 
 AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 FACES_DIR.mkdir(parents=True, exist_ok=True)
+TTS_CACHE_DIR = AUDIO_DIR / "tts_cache"
+TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.2")
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-transcribe")
@@ -241,21 +254,43 @@ def play_audio_file(wav_path, check=True):
     )
 
 
-def prepare_speech_audio(text: str):
+def _tts_cache_path(speech_text: str, cfg: dict) -> Path:
+    identity = json.dumps(
+        {
+            "engine": cfg.get("engine"),
+            "model": MIGUEL_TTS_MODEL,
+            "voice": cfg.get("voice"),
+            "instructions": cfg.get("instructions"),
+            "text": speech_text,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return TTS_CACHE_DIR / f"{digest}.wav"
+
+
+def prepare_speech_audio(text: str, cache: bool = False):
     speech_text = clean_text_for_speech(text)
     if not speech_text:
         return None
 
     cfg = get_tts_config_for_voice_mode()
+    cache_path = _tts_cache_path(speech_text, cfg) if cache else None
+    if cache_path is not None and cache_path.is_file() and cache_path.stat().st_size > 44:
+        print(f"[TTS CACHE] hit={text}")
+        return {"text": text, "speech_text": speech_text, "wav_path": str(cache_path), "cached": True}
+
     if cfg.get("engine") == "espeak" or MIGUEL_TTS_ENGINE.lower() != "openai":
-        wav_path = Path(tempfile.gettempdir()) / "miguel_speech.wav"
+        wav_path = cache_path or (Path(tempfile.gettempdir()) / "miguel_speech.wav")
         subprocess.run(
             ["espeak", "-s", "145", "-p", "42", "-a", "135", "-w", str(wav_path), speech_text],
             check=True,
         )
-        return {"text": text, "speech_text": speech_text, "wav_path": str(wav_path)}
+        return {"text": text, "speech_text": speech_text, "wav_path": str(wav_path), "cached": False}
 
-    wav_path = Path(tempfile.gettempdir()) / "miguel_speech_openai.wav"
+    wav_path = cache_path or (Path(tempfile.gettempdir()) / "miguel_speech_openai.wav")
+    write_path = wav_path.with_suffix(".tmp.wav") if cache_path is not None else wav_path
     response = client.audio.speech.create(
         model=MIGUEL_TTS_MODEL,
         voice=cfg.get("voice", "cedar"),
@@ -263,8 +298,11 @@ def prepare_speech_audio(text: str):
         instructions=cfg.get("instructions"),
         response_format="wav",
     )
-    response.write_to_file(str(wav_path))
-    return {"text": text, "speech_text": speech_text, "wav_path": str(wav_path)}
+    response.write_to_file(str(write_path))
+    if cache_path is not None:
+        os.replace(write_path, wav_path)
+        print(f"[TTS CACHE] stored={text}")
+    return {"text": text, "speech_text": speech_text, "wav_path": str(wav_path), "cached": False}
 
 
 def play_prepared_speech(prepared):
@@ -305,7 +343,7 @@ def speak(text: str):
             print(f"{ROBOT_NAME} says: {text}")
             speak_with_espeak(speech_text)
 
-def open_raw_mic_stream():
+def _open_raw_mic_stream_for_source(pulse_source=""):
     cmd = [
         "arecord",
         "-q",
@@ -317,8 +355,8 @@ def open_raw_mic_stream():
     ]
 
     env = os.environ.copy()
-    if MIC_DEVICE == "pulse" and PULSE_SOURCE:
-        env["PULSE_SOURCE"] = PULSE_SOURCE
+    if MIC_DEVICE == "pulse" and pulse_source:
+        env["PULSE_SOURCE"] = pulse_source
 
     return subprocess.Popen(
         cmd,
@@ -328,9 +366,29 @@ def open_raw_mic_stream():
     )
 
 
+def open_raw_mic_stream():
+    sources = [source for source in (PULSE_SOURCE, PULSE_SOURCE_SECONDARY) if source]
+    if MIC_DEVICE != "pulse" or len(sources) < 2:
+        return _open_raw_mic_stream_for_source(PULSE_SOURCE)
+
+    streams = []
+    try:
+        streams = [_open_raw_mic_stream_for_source(source) for source in sources]
+        print(f"[AUDIO] Dual ReSpeaker capture active: {len(streams)} arrays.")
+        return DualMicStream(streams)
+    except Exception as exc:
+        print(f"[AUDIO] Secondary ReSpeaker unavailable; using primary: {exc}")
+        for stream in streams:
+            stop_stream(stream)
+        return _open_raw_mic_stream_for_source(PULSE_SOURCE)
+
+
 def stop_stream(proc):
     if proc is None:
         return
+    selected_chunks = getattr(proc, "selected_chunks", None)
+    if selected_chunks is not None:
+        print(f"[AUDIO] Dual ReSpeaker chunks selected: {selected_chunks}")
     try:
         proc.terminate()
         proc.wait(timeout=1)
@@ -342,19 +400,16 @@ def stop_stream(proc):
 
 
 def stereo_raw_to_mono_bytes(raw_bytes: bytes):
-    samples = np.frombuffer(raw_bytes, dtype=np.int16)
+    return strongest_stereo_channel(raw_bytes)
 
-    if len(samples) < 2:
-        return b"", 0.0
 
-    samples = samples[: len(samples) - (len(samples) % 2)]
-    stereo = samples.reshape(-1, 2)
-
-    mono = stereo.mean(axis=1).astype(np.int16)
-
-    rms = float(np.sqrt(np.mean(mono.astype(np.float32) ** 2))) if len(mono) else 0.0
-
-    return mono.tobytes(), rms
+def adaptive_speech_threshold(noise_rms_samples):
+    return adaptive_rms_threshold(
+        noise_rms_samples,
+        minimum=SPEECH_RMS_MIN_THRESHOLD,
+        maximum=SPEECH_RMS_THRESHOLD,
+        multiplier=SPEECH_NOISE_MULTIPLIER,
+    )
 
 
 def text_contains_any(text: str, phrases):
@@ -487,14 +542,21 @@ def transcribe_audio_openai(wav_path):
 
 def capture_user_turn():
     print("Listening for your turn with OpenAI transcription...")
+    capture_user_turn.last_timing = {}
     AUDIO_CAPTURE_ACTIVE.set()
 
     proc = open_raw_mic_stream()
 
     start_time = time.time()
+    started_monotonic = time.monotonic()
     last_voice_time = start_time
+    speech_started_at = None
+    speech_started_monotonic = None
+    endpoint_silence_observed = None
     speech_started = False
     mono_chunks = []
+    pre_roll = deque(maxlen=max(1, int(round(SPEECH_PREROLL_SECONDS * 1000.0 / CHUNK_MS))))
+    noise_rms_samples = deque(maxlen=max(5, int(round(2.0 * 1000.0 / CHUNK_MS))))
     rms_peak = 0.0
 
     wav_path = AUDIO_DIR / "miguel_user_turn_openai.wav"
@@ -521,22 +583,38 @@ def capture_user_turn():
             # Always keep audio after capture starts.
             if speech_started:
                 mono_chunks.append(mono_bytes)
+            else:
+                pre_roll.append(mono_bytes)
+
+            speech_threshold = adaptive_speech_threshold(noise_rms_samples)
 
             # Start capture when speech is detected.
-            if rms > SPEECH_RMS_THRESHOLD:
+            if rms > speech_threshold:
                 if not speech_started:
-                    print(f"Speech started. RMS={rms:.1f}")
+                    print(f"Speech started. RMS={rms:.1f} threshold={speech_threshold:.1f}")
                     speech_started = True
-                    mono_chunks.append(mono_bytes)
+                    speech_started_at = time.time()
+                    speech_started_monotonic = time.monotonic()
+                    mono_chunks.extend(pre_roll)
+                    pre_roll.clear()
 
                 last_voice_time = time.time()
+            elif not speech_started and rms < SPEECH_RMS_MIN_THRESHOLD:
+                # Learn only clear ambient chunks; treating a quiet voice as
+                # noise would raise the detector threshold against the user.
+                noise_rms_samples.append(rms)
 
             if speech_started:
                 turn_age = time.time() - start_time
                 silence_age = time.time() - last_voice_time
 
-                if turn_age >= MIN_TURN_SECONDS and silence_age >= SILENCE_SECONDS:
+                spoken_seconds = max(0.0, now - (speech_started_at or start_time))
+                endpoint_silence = (
+                    SHORT_UTTERANCE_SILENCE_SECONDS if spoken_seconds < 1.25 else SILENCE_SECONDS
+                )
+                if turn_age >= MIN_TURN_SECONDS and silence_age >= endpoint_silence:
                     print("Silence timeout reached.")
+                    endpoint_silence_observed = silence_age
                     break
 
         if not mono_chunks:
@@ -547,13 +625,43 @@ def capture_user_turn():
         print(f"Saved user audio: {wav_path}")
         print(f"Peak RMS: {rms_peak:.1f}")
 
+        transcription_started = time.monotonic()
         user_text = transcribe_audio_openai(wav_path)
+        transcription_finished = time.monotonic()
+        capture_timing = {
+            "capture_total_ms": (transcription_finished - started_monotonic) * 1000,
+            "speech_wait_ms": (
+                max(0.0, speech_started_monotonic - started_monotonic) * 1000
+                if speech_started_monotonic is not None
+                else None
+            ),
+            "speech_duration_ms": (
+                max(0.0, last_voice_time - speech_started_at) * 1000
+                if speech_started_at is not None
+                else None
+            ),
+            "endpoint_silence_ms": (
+                max(0.0, endpoint_silence_observed) * 1000
+                if endpoint_silence_observed is not None
+                else None
+            ),
+            "transcription_ms": (transcription_finished - transcription_started) * 1000,
+        }
+        capture_user_turn.last_timing = capture_timing
+        print(
+            "[AUDIO LATENCY] "
+            f"capture_total={capture_timing['capture_total_ms'] / 1000:.3f}s "
+            f"transcription={capture_timing['transcription_ms'] / 1000:.3f}s"
+        )
         print(f"Final heard by OpenAI transcription: {user_text}")
 
         return user_text
 
     finally:
         stop_stream(proc)
+
+
+capture_user_turn.last_timing = {}
 
 
 # ============================================================
