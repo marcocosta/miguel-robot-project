@@ -16,8 +16,8 @@ echo "[1/3] Activating Python environment..."
 source "$HOME/robot-project/week3/camera/venv/bin/activate"
 
 echo "[2/3] Checking core files..."
-if [ ! -f "$HOME/robot-project/week3/camera/robot_voice_vision.py" ]; then
-  echo "ERROR: robot_voice_vision.py not found."
+if [ ! -f "$HOME/robot-project/week3/camera/robot_cloud_brain_v7_5_queue.py" ]; then
+  echo "ERROR: robot_cloud_brain_v7_5_queue.py not found."
   exit 1
 fi
 
@@ -28,4 +28,4 @@ fi
 
 echo "[3/3] Starting robot..."
 echo
-python "$HOME/robot-project/week3/camera/robot_voice_vision.py"
+python "$HOME/robot-project/week3/camera/robot_cloud_brain_v7_5_queue.py"

@@ -1,0 +1,3 @@
+# Optional Stage-0 XVF3800 USB control dependencies.
+pyusb==1.3.1
+libusb-package==1.0.30.0

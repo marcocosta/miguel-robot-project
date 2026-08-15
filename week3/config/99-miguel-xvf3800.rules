@@ -1,0 +1,3 @@
+# Allow Miguel's runtime user (a member of plugdev) to issue XVF3800 USB
+# vendor-control reads for firmware, DoA, and VAD. Replug after installation.
+SUBSYSTEM=="usb", ATTR{idVendor}=="2886", ATTR{idProduct}=="001a", MODE="0660", GROUP="plugdev", TAG+="uaccess"

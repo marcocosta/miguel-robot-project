@@ -37,6 +37,10 @@ if str(THIS_DIR) not in sys.path:
 
 import robot_cloud_brain_v7_full as full
 from miguel_teacher import OpenAICloudTeacherClient, TeacherModeController
+from miguel_conversation_manager import ConversationManager
+from miguel_conversation_events import InteractionState
+from miguel_respeaker_xvf3800 import XVF3800Monitor
+from miguel_turn_endpoint import ConversationConfig
 import robot_timer
 
 import robot_memory
@@ -390,6 +394,8 @@ class RobotRuntimeState:
     )
     suppress_next_ready_cue: bool = False
     conversation_log_session_id: str | None = None
+    conversation_manager: ConversationManager | None = None
+    xvf_monitor: XVF3800Monitor | None = None
 
 
 @dataclass
@@ -867,6 +873,8 @@ def expire_conversation_session_if_needed(state: RobotRuntimeState) -> bool:
             expired = True
     if expired:
         print("[V7.14 CONVERSATION] expired reason=timeout")
+        if state.conversation_manager:
+            state.conversation_manager.close_conversation("session_timeout")
         notify_face_status(state, "wake_required", _wake_required_face_text())
     return expired
 
@@ -1291,6 +1299,25 @@ def force_interaction_state(state: RobotRuntimeState, new_state: str, status_tex
         state.last_state_emit_key = (new_state, _interaction_status_key(new_state, status_text))
     print(f"[V7.5 STATE] {old_state} -> {new_state} {status_text}".strip())
     notify_face_status(state, new_state, status_text)
+
+
+def _apply_conversation_manager_ui_state(
+    runtime_state: RobotRuntimeState,
+    conversation_state: InteractionState,
+    reason: str,
+) -> None:
+    """Map manager-owned turn state onto the established debounced face UI."""
+    if conversation_state == InteractionState.IDLE:
+        set_interaction_state(runtime_state, "idle", "")
+    elif conversation_state == InteractionState.ENGAGED:
+        set_interaction_state(runtime_state, _ready_face_state(), _ready_face_text(runtime_state))
+    elif conversation_state in {InteractionState.LISTENING, InteractionState.END_CANDIDATE}:
+        # END_CANDIDATE deliberately remains visually listening.
+        set_interaction_state(runtime_state, "listening", "YOUR TURN")
+    elif conversation_state == InteractionState.PREPARING:
+        set_interaction_state(runtime_state, "thinking", "Thinking")
+    elif conversation_state == InteractionState.SPEAKING:
+        set_interaction_state(runtime_state, "speaking", "Speaking")
 
 
 def _update_face_identity_runtime_state(
@@ -2220,6 +2247,9 @@ def install_speech_queue(reply_queue: queue.Queue, safety: SafetyGuard, state: R
             latency.setdefault("log_topic", state.session_focus or state.last_topic or "")
             state.pending_reply_count += 1
         latency["reply_queued_at"] = time.monotonic()
+        if state.conversation_manager:
+            state.conversation_manager.response_ready(latency["reply_queued_at"])
+            latency.update(state.conversation_manager.latency_fields())
         _log_latency("reply_queued", latency.get("turn_started_at"))
         reply_queue.put(ReplyEvent(str(text or ""), latency, context))
 
@@ -2973,6 +3003,11 @@ def _enqueue_user_turn(
             _request_speech_stop(state)
 
     now = time.monotonic()
+    manager = state.conversation_manager
+    if manager:
+        if _has_v7_5_wake_phrase(text) or authorization_source == "wake_phrase":
+            manager.on_wake(text, recognized_person, now)
+        manager.accepted_turn(now)
     normalized_text = normalize_command_text(text)
     if not stripped_text and _has_v7_5_wake_phrase(text):
         stripped_text = _strip_wake_phrase(text)
@@ -2982,6 +3017,8 @@ def _enqueue_user_turn(
         state.last_non_self_heard_user_text = str(text or "")
         state.current_turn_started_at = now
         state.current_turn_latency = {"turn_started_at": now, "transcript_ready_at": now}
+        if manager:
+            state.current_turn_latency.update(manager.latency_fields())
         state.pending_user_turn_count += 1
     set_interaction_state(state, "heard", str(text or "")[:48])
     _log_latency("transcript_ready", now)
@@ -2994,17 +3031,21 @@ def _enqueue_user_turn(
     with state.lock:
         turn_latency.update(state.last_audio_capture_timing)
         state.last_audio_capture_timing = {}
-    user_turn_queue.put(
-        UserTurnEvent(
-            text,
-            recognized_person,
-            bool(authorized),
-            str(authorization_source or ""),
-            normalized_text,
-            str(stripped_text or ""),
-            turn_latency,
-        )
+    event = UserTurnEvent(
+        text,
+        recognized_person,
+        bool(authorized),
+        str(authorization_source or ""),
+        normalized_text,
+        str(stripped_text or ""),
+        turn_latency,
     )
+    try:
+        user_turn_queue.put_nowait(event)
+    except queue.Full:
+        with state.lock:
+            state.pending_user_turn_count = max(0, state.pending_user_turn_count - 1)
+        print("[V7.5 AUDIO] user turn queue full; dropped completed turn safely.")
 
 
 def _looks_like_asr_prompt_leak(text: str) -> bool:
@@ -3175,7 +3216,7 @@ def capture_user_turn_when_ready(state: RobotRuntimeState) -> str:
         notify_face_status(state, "listening", "YOUR TURN")
     reason = "empty"
     try:
-        user_text = v6.capture_user_turn()
+        user_text = v6.capture_user_turn(conversation_manager=state.conversation_manager)
         timing = dict(getattr(v6.capture_user_turn, "last_timing", {}) or {})
         with state.lock:
             state.last_audio_capture_timing = timing
@@ -4139,6 +4180,27 @@ def _log_user_turn_event(state: RobotRuntimeState, user_text: str, route_hint: s
     with state.lock:
         state.last_logged_user_turn_at = logged_at
         state.last_logged_user_turn_text = str(user_text or "")
+    with state.lock:
+        latency = dict(state.current_turn_latency)
+    diagnostics = {
+        key: round(float(latency[key]))
+        for key in (
+            "speech_to_eot_delay_ms", "eot_to_final_asr_ms",
+            "eot_to_brain_request_ms", "eot_to_response_ready_ms",
+            "eot_to_first_audio_ms",
+        )
+        if isinstance(latency.get(key), (int, float))
+    }
+    monotonic_timing = {
+        key: latency[key]
+        for key in (
+            "speech_start_monotonic", "last_detected_voice_monotonic",
+            "silence_start_monotonic", "turn_commit_monotonic",
+            "final_asr_monotonic", "brain_request_start_monotonic",
+            "brain_response_ready_monotonic", "tts_first_audio_monotonic",
+        )
+        if isinstance(latency.get(key), (int, float))
+    }
     _append_log_event(
         state,
         "user_turn",
@@ -4147,6 +4209,10 @@ def _log_user_turn_event(state: RobotRuntimeState, user_text: str, route_hint: s
         route_hint=route_hint,
         topic=_active_creative_topic(state) or "",
         conversation_mode=getattr(state, "conversation_mode", "general"),
+        diagnostics=diagnostics,
+        monotonic_timing=monotonic_timing,
+        endpoint_reason=str(latency.get("turn_commit_reason") or ""),
+        repair_consider=bool(latency.get("repair_consider", False)),
     )
 
 
@@ -4201,9 +4267,24 @@ def _log_assistant_reply_event(
         "transcription_ms",
         "story_generation_ms",
         "story_speech_slot_wait_ms",
+        "speech_to_eot_delay_ms",
+        "eot_to_final_asr_ms",
+        "eot_to_brain_request_ms",
+        "eot_to_response_ready_ms",
+        "eot_to_first_audio_ms",
     ):
         if latency.get(key) is not None:
             payload["diagnostics"][key] = round(float(latency[key]))
+    payload["monotonic_timing"] = {
+        key: latency[key]
+        for key in (
+            "speech_start_monotonic", "last_detected_voice_monotonic",
+            "silence_start_monotonic", "turn_commit_monotonic",
+            "final_asr_monotonic", "brain_request_start_monotonic",
+            "brain_response_ready_monotonic", "tts_first_audio_monotonic",
+        )
+        if latency.get(key) is not None
+    }
     event_type = "startup_announcement" if route == "startup" else "turn"
     _append_log_event(state, event_type, **payload)
     if event_type != "turn":
@@ -9305,6 +9386,27 @@ def _is_sleep_wake_request(text: str) -> bool:
     return normalized in wake_phrases or any(normalized.startswith(phrase + " ") for phrase in wake_phrases)
 
 
+def _is_explicit_conversation_closure(text: str) -> bool:
+    normalized = normalize_command_text(text)
+    return normalized in {
+        "goodbye", "bye", "bye miguel", "see you later", "talk to you later",
+        "good night", "tchau", "tchau miguel", "ate logo", "ate mais",
+        "au revoir", "a bientot",
+    }
+
+
+def _close_conversation_session(state: RobotRuntimeState, reason: str) -> None:
+    with state.lock:
+        state.conversation_active = False
+        state.conversation_mode = "wake_required"
+        state.conversation_partner = None
+        state.conversation_until = 0.0
+        state.wake_required = True
+        state.wake_required_reason = reason
+    if state.conversation_manager:
+        state.conversation_manager.close_conversation(reason)
+
+
 def _activate_sleep_mode(state: RobotRuntimeState) -> None:
     with state.lock:
         state.sleep_mode_active = True
@@ -9318,6 +9420,8 @@ def _activate_sleep_mode(state: RobotRuntimeState) -> None:
         state.wake_required_reason = "sleep"
         state.audio_capture_active = False
         state.audio_capture_blocked_reason = "sleep"
+    if state.conversation_manager:
+        state.conversation_manager.close_conversation("sleep_mode")
     set_interaction_state(state, "sleeping", "Sleep")
 
 
@@ -9328,6 +9432,8 @@ def _deactivate_sleep_mode(state: RobotRuntimeState) -> None:
         state.current_mode = "normal"
         state.wake_required = False
         state.wake_required_reason = ""
+    if state.conversation_manager:
+        state.conversation_manager.on_wake("sleep_wake")
 
 
 def _route_sleep_control(user_text: str, state: RobotRuntimeState, partner: str | None = None) -> bool | None:
@@ -9400,6 +9506,7 @@ def _route_shutdown_control(user_text: str, state: RobotRuntimeState) -> bool | 
 
     if pending and _is_shutdown_confirm_text(user_text):
         _set_shutdown_pending(state, False)
+        _close_conversation_session(state, "shutdown_confirmed")
         _set_reply_context(state, "shutdown_confirm")
         v6.speak("Confirmed.")
         with state.lock:
@@ -11087,8 +11194,13 @@ def audio_worker(
                         familiar_present=familiar_present,
                     )
                     directed = is_directed_to_miguel(user_text, state)
-                    if active and (
+                    manager_accepts = bool(
+                        state.conversation_manager
+                        and state.conversation_manager.accept_human_turn(user_text, person=recognized)
+                    )
+                    if (active or manager_accepts) and (
                         directed
+                        or manager_accepts
                         or accepted_short_followup
                         or _infer_conversation_mode(user_text) != "general"
                         or _short_answer_after_robot_question(user_text, state)
@@ -11226,8 +11338,12 @@ def audio_worker(
                 )
                 continue
 
-            if conversation_active:
-                directed = is_directed_to_miguel(user_text, state)
+            directed = is_directed_to_miguel(user_text, state)
+            manager_accepts = bool(
+                state.conversation_manager
+                and state.conversation_manager.accept_human_turn(user_text)
+            )
+            if conversation_active or manager_accepts:
                 accepted_short_followup = _accept_v715_short_followup_if_allowed(
                     user_text,
                     state,
@@ -11235,6 +11351,7 @@ def audio_worker(
                 )
                 if (
                     directed
+                    or manager_accepts
                     or accepted_short_followup
                     or _infer_conversation_mode(user_text) != "general"
                     or _short_answer_after_robot_question(user_text, state)
@@ -11393,6 +11510,10 @@ def brain_worker(
 
         try:
             event_authorized = bool(getattr(event, "authorized", False))
+            brain_started = time.monotonic()
+            if state.conversation_manager:
+                state.conversation_manager.turn_timing["brain_request_start_monotonic"] = brain_started
+                event.latency["brain_request_start_monotonic"] = brain_started
             if event_authorized:
                 with state.lock:
                     state.brain_is_processing = True
@@ -11461,6 +11582,21 @@ def handle_queued_turn(
     if event_authorized:
         print(f"[V7.14 AUTH] accepted source={auth_source} text={_short_log_text(user_text)}")
 
+    if event and bool(event.latency.get("repair_consider")):
+        print(
+            f"[EOT_REPAIR] action=request_continuation "
+            f"reason={event.latency.get('turn_commit_reason') or 'repair_timeout'}"
+        )
+        _remember_accepted_turn(state, user_text)
+        _log_user_turn_event(state, user_text, route_hint="endpoint_repair", partner=partner)
+        _set_reply_context(state, "endpoint_repair")
+        v6.speak("I think you may have more to say. Would you like to continue?")
+        with state.lock:
+            turn_started_at = state.current_turn_latency.get("turn_started_at") or time.monotonic()
+            state.current_turn_latency.setdefault("turn_started_at", turn_started_at)
+        _mark_route_done(state, turn_started_at)
+        return True
+
     sleep_result = _route_sleep_control(user_text, state, partner=partner)
     if sleep_result is not None:
         with state.lock:
@@ -11474,6 +11610,18 @@ def handle_queued_turn(
             state.current_turn_latency.setdefault("turn_started_at", turn_started_at)
         _mark_route_done(state, turn_started_at)
         return sleep_result
+
+    if _is_explicit_conversation_closure(user_text):
+        _remember_accepted_turn(state, user_text)
+        _log_user_turn_event(state, user_text, route_hint="conversation_close", partner=partner)
+        _close_conversation_session(state, "explicit_closure")
+        _set_reply_context(state, "conversation_close")
+        v6.speak("Goodbye.")
+        with state.lock:
+            turn_started_at = state.current_turn_latency.get("turn_started_at") or time.monotonic()
+            state.current_turn_latency.setdefault("turn_started_at", turn_started_at)
+        _mark_route_done(state, turn_started_at)
+        return True
 
     had_wake_phrase = _has_v7_5_wake_phrase(user_text)
     if _is_bare_wake_phrase(user_text):
@@ -12087,6 +12235,7 @@ def speech_worker(
         response_length_mode = str(latency.get("response_length_mode") or "normal")
         response_depth_mode = str(latency.get("response_depth_mode") or "normal")
         route = context
+        robot_floor_granted = False
         try:
             if state.stop_event.is_set() and route != "shutdown_confirm":
                 print("[V7.5 SHUTDOWN] Dropped non-terminal queued reply.")
@@ -12180,10 +12329,6 @@ def speech_worker(
                     state.stop_speech_event.clear()
 
                 try:
-                    with state.lock:
-                        state.is_speaking = True
-                        state.last_spoken_text = text
-                        state.last_robot_text = text
                     prepare_started = time.monotonic()
                     _log_latency("tts_prepare_started", latency.get("turn_started_at"))
                     prepared = None
@@ -12194,6 +12339,18 @@ def speech_worker(
                         except Exception as exc:
                             print("[V7.5 SPEECH] TTS prepare failed; falling back:", exc)
                             can_prepare = False
+                    # Response generation and TTS preparation may happen while
+                    # nobody owns the floor. Playback may not begin until the
+                    # manager explicitly grants Miguel the floor.
+                    if state.conversation_manager:
+                        robot_floor_granted = state.conversation_manager.grant_robot_floor(text)
+                        if not robot_floor_granted:
+                            print("[FLOOR] grant=MIGUEL allowed=false action=drop_reply")
+                            continue
+                    with state.lock:
+                        state.is_speaking = True
+                        state.last_spoken_text = text
+                        state.last_robot_text = text
                     playback_started = time.monotonic()
                     latency["tts_prepare_ms"] = max(0.0, playback_started - prepare_started) * 1000
                     if latency.get("turn_started_at"):
@@ -12208,6 +12365,25 @@ def speech_worker(
                     _log_latency("speak_started", latency.get("turn_started_at"))
                     set_interaction_state(state, "speaking", text[:48])
                     speak_started = time.monotonic()
+                    # Prepared playback begins synchronously at the next call,
+                    # so this is the closest available first-audio timestamp.
+                    # The fallback path prepares internally and cannot expose a
+                    # truthful first-audio timestamp, so it is intentionally omitted.
+                    if can_prepare:
+                        latency["tts_first_audio_monotonic"] = speak_started
+                        if state.conversation_manager:
+                            state.conversation_manager.robot_first_audio(speak_started)
+                            latency.update(state.conversation_manager.latency_fields())
+                    metrics = " ".join(
+                        f"{key}={value:.1f}"
+                        for key, value in latency.items()
+                        if key in {
+                            "speech_to_eot_delay_ms", "eot_to_final_asr_ms",
+                            "eot_to_brain_request_ms", "eot_to_response_ready_ms",
+                            "eot_to_first_audio_ms",
+                        } and isinstance(value, (int, float))
+                    )
+                    print(f"[RESPONSE_LATENCY] {metrics}")
                     if can_prepare:
                         v6.play_prepared_speech(prepared)
                     else:
@@ -12222,6 +12398,10 @@ def speech_worker(
                     _log_latency("speak_finished", latency.get("turn_started_at"))
                     _log_latency_summary(latency, text, speak_started, speak_finished)
                     _update_prompt_state(text, state)
+                    if state.conversation_manager:
+                        with state.lock:
+                            expected_person = state.conversation_partner or state.recognized_person
+                        state.conversation_manager.robot_speech_ended(text, expected_person)
                     _log_assistant_reply_event(state, text, route, latency_override=latency)
                     with state.lock:
                         answer_topic = state.session_focus or state.last_topic or ""
@@ -12233,6 +12413,11 @@ def speech_worker(
                         state.last_answer_text_short = _short_log_text(text, 120)
                         state.last_answer_at = time.time()
                 finally:
+                    if (
+                        state.conversation_manager
+                        and state.conversation_manager.floor_owner.value == "MIGUEL"
+                    ):
+                        state.conversation_manager.robot_speech_ended("")
                     with state.lock:
                         state.is_speaking = False
                         state.last_speech_finished_at = time.time()
@@ -12416,10 +12601,21 @@ def run_v7_5_queue():
     full.face_happy("Miguel online")
 
     safety = SafetyGuard()
-    user_turn_queue = queue.Queue()
-    reply_queue = queue.Queue()
+    queue_size = max(2, _env_int("MIGUEL_CONVERSATION_QUEUE_SIZE", 8))
+    user_turn_queue = queue.Queue(maxsize=queue_size)
+    reply_queue = queue.Queue(maxsize=queue_size)
     stop_event = threading.Event()
     state = RobotRuntimeState(stop_event=stop_event)
+    conversation_config = ConversationConfig.from_env()
+    state.conversation_manager = ConversationManager(
+        conversation_config,
+        state_observer=lambda conv_state, reason: _apply_conversation_manager_ui_state(
+            state, conv_state, reason
+        ),
+    )
+    if conversation_config.enable_xvf_monitor:
+        state.xvf_monitor = XVF3800Monitor()
+        print(state.xvf_monitor.startup_log())
     _initialize_startup_conversation_mode(state)
     state.user_turn_queue = user_turn_queue
     state.reply_queue = reply_queue
@@ -12560,6 +12756,9 @@ def run_v7_5_queue():
 
         if camera_manager:
             camera_manager.stop()
+
+        if state.xvf_monitor:
+            state.xvf_monitor.close()
 
         if full.face:
             try:

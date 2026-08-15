@@ -36,15 +36,20 @@ def load_v7_5_module():
 
     fake_robot_memory = types.ModuleType("robot_memory")
     fake_robot_memory.select_conversation_logs = lambda **kwargs: []
+    fake_robot_memory.set_pending_shutdown = lambda pending: None
 
     fake_robot_timer = types.ModuleType("robot_timer")
+    fake_robot_timer.parse_timer_command = lambda text: None
+    fake_robot_timer.start_timer = lambda seconds: {"ok": True, "seconds": seconds}
+    fake_robot_timer.cancel_timer = lambda: {"ok": True}
+    fake_robot_timer.get_timer_status = lambda: {"active": False}
+    fake_robot_timer.timer_tick = lambda: None
 
     fake_depthai = types.ModuleType("depthai")
     fake_cv2 = types.ModuleType("cv2")
     fake_numpy = types.ModuleType("numpy")
 
-    sys.modules.update(
-        {
+    replacements = {
             "robot_cloud_brain_v7_full": fake_full,
             "robot_memory": fake_robot_memory,
             "robot_timer": fake_robot_timer,
@@ -53,10 +58,21 @@ def load_v7_5_module():
             "numpy": fake_numpy,
             "v7.camera_intents": fake_camera_intents,
             "v7.safety_guard": fake_safety_guard,
-        }
-    )
+    }
+    previous = {name: sys.modules.get(name) for name in replacements}
+    sys.modules.update(replacements)
     sys.modules.pop("robot_cloud_brain_v7_5_queue", None)
-    return importlib.import_module("robot_cloud_brain_v7_5_queue")
+    try:
+        return importlib.import_module("robot_cloud_brain_v7_5_queue")
+    finally:
+        # The imported runtime keeps direct references to these controlled
+        # fakes. Restore process-global modules so later tests see real numpy,
+        # OpenCV, DepthAI, and project modules.
+        for name, module in previous.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
 
 
 def wait_for_story_worker(state, timeout: float = 3.0) -> None:
@@ -78,6 +94,58 @@ def wait_until(predicate, timeout: float = 2.0) -> None:
             return
         time.sleep(0.01)
     raise AssertionError("condition timed out")
+
+
+def test_stage1_preserves_shutdown_confirmation_router() -> None:
+    q = load_v7_5_module()
+    spoken = []
+    q.v6.speak = spoken.append
+    state = q.RobotRuntimeState(stop_event=threading.Event())
+    state.conversation_manager = q.ConversationManager(q.ConversationConfig(), logger=lambda _line: None)
+
+    assert q._route_shutdown_control("shutdown", state) is True
+    assert state.shutdown_confirmation_pending
+    assert spoken[-1] == "Shutdown confirmation required."
+    assert q._route_shutdown_control("cancel shutdown", state) is True
+    assert not state.shutdown_confirmation_pending
+    assert spoken[-1] == "Shutdown canceled."
+
+
+def test_stage1_preserves_timer_router() -> None:
+    q = load_v7_5_module()
+    spoken = []
+    q.v6.speak = spoken.append
+    q.robot_timer.parse_timer_command = lambda text: {"intent": "start_timer", "seconds": 300}
+    q.robot_timer.start_timer = lambda seconds: {"ok": True, "seconds": seconds}
+    state = q.RobotRuntimeState(stop_event=threading.Event())
+
+    assert q._route_timer_local_reply("set a timer for five minutes", state) is True
+    assert spoken
+    assert "5 minutes" in spoken[-1]
+
+
+def test_stage1_repair_timeout_requests_continuation_before_domain_routing() -> None:
+    q = load_v7_5_module()
+    spoken = []
+    q.v6.speak = spoken.append
+    state = q.RobotRuntimeState(stop_event=threading.Event())
+    event = q.UserTurnEvent(
+        "can you tell me and",
+        "Marco",
+        True,
+        "active_conversation",
+        "can you tell me and",
+        "can you tell me and",
+        {
+            "repair_consider": True,
+            "turn_commit_reason": "repair_timeout",
+            "turn_started_at": time.monotonic(),
+        },
+    )
+
+    assert q.handle_queued_turn(event, None, None, state) is True
+    assert spoken == ["I think you may have more to say. Would you like to continue?"]
+    assert state.current_turn_latency["reply_context"] == "endpoint_repair"
 
 
 def test_portuguese_long_story_requests_infer_long_story() -> None:
