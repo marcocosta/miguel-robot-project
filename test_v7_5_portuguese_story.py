@@ -111,6 +111,164 @@ def test_stage1_preserves_shutdown_confirmation_router() -> None:
     assert spoken[-1] == "Shutdown canceled."
 
 
+def test_capture_exception_diagnostics_are_updated_and_rate_limited() -> None:
+    q = load_v7_5_module()
+    state = q.RobotRuntimeState(stop_event=threading.Event())
+    events = []
+    q._append_log_event = lambda _state, event_type, **payload: events.append((event_type, payload))
+
+    original_monotonic = q.time.monotonic
+    samples = iter((100.0, 101.0, 111.0))
+    q.time.monotonic = lambda: next(samples)
+    try:
+        q._record_audio_capture_exception(state, TypeError("unsupported keyword"))
+        q._record_audio_capture_exception(state, TypeError("unsupported keyword"))
+        q._record_audio_capture_exception(state, RuntimeError("device unavailable"))
+    finally:
+        q.time.monotonic = original_monotonic
+
+    assert state.consecutive_audio_capture_errors == 3
+    assert state.last_capture_exception_type == "RuntimeError"
+    assert state.last_capture_exception_message == "device unavailable"
+    assert [event[0] for event in events] == ["capture_error", "capture_error"]
+
+
+def test_normal_and_keyboard_shutdown_log_exactly_one_terminal_event() -> None:
+    q = load_v7_5_module()
+    for reason in ("stop_requested", "keyboard_interrupt"):
+        state = q.RobotRuntimeState(stop_event=threading.Event())
+        state.audio_worker_started_at = time.time()
+        state.audio_capture_attempt_count = 3
+        state.audio_capture_transcript_count = 2
+        logged = []
+        q._append_log_event = lambda _state, event_type, **payload: logged.append((event_type, payload))
+
+        assert q._log_session_end_once(state, reason, []) is True
+        assert q._log_session_end_once(state, reason, []) is False
+        terminal = [event for event in logged if event[0] == "session_end"]
+        assert len(terminal) == 1
+        assert terminal[0][1]["reason"] == reason
+        context = terminal[0][1]["runtime_context"]
+        assert context["audio"]["worker_started"] is True
+        assert context["audio"]["capture_attempts"] == 3
+        assert context["audio"]["transcripts"] == 2
+        assert "queues" in context
+        assert "turn" in context
+        assert "workers_alive_after_join" in context
+
+
+def test_sigint_uses_graceful_keyboard_interrupt_reason() -> None:
+    q = load_v7_5_module()
+    stop_event = threading.Event()
+    reasons = []
+    previous = q._install_shutdown_signal_handlers(stop_event, reasons.append)
+    try:
+        handler = q.signal.getsignal(q.signal.SIGINT)
+        handler(q.signal.SIGINT, None)
+        assert stop_event.is_set()
+        assert reasons == ["keyboard_interrupt"]
+    finally:
+        q._restore_signal_handlers(previous)
+
+
+def test_audio_worker_stops_before_session_end_context_is_collected() -> None:
+    q = load_v7_5_module()
+    state = q.RobotRuntimeState(stop_event=threading.Event())
+    state.conversation_manager = q.ConversationManager(q.ConversationConfig(), logger=lambda _line: None)
+
+    class Camera:
+        @staticmethod
+        def get_face_state(max_age_seconds):
+            assert max_age_seconds == 2.0
+            return {"recognized_person": None, "face_detected": False, "face_count": 0}
+
+    q._watchdog_audio_capture_state = lambda _state: None
+    q._expire_shutdown_confirmation_if_needed = lambda _state: None
+    q.expire_conversation_session_if_needed = lambda _state: None
+    q._update_face_identity_runtime_state = lambda *_args: ("none", "none")
+    q._maybe_surface_unknown_face = lambda *_args: None
+    q.set_interaction_state = lambda *_args: None
+    q._wait_until_listening_allowed = lambda _state: None
+
+    def cancelled_capture(_state):
+        state.stop_event.set()
+        return ""
+
+    q.capture_user_turn_when_ready = cancelled_capture
+    audio = threading.Thread(
+        target=q.audio_worker,
+        args=(Camera(), q.queue.Queue(), state),
+        name="AudioWorker",
+    )
+    audio.start()
+    audio.join(timeout=0.75)
+
+    assert not audio.is_alive()
+    context = q._shutdown_runtime_context(state, [audio])
+    assert context["audio"]["capture_active"] is False
+    assert context["workers_alive_after_join"]["AudioWorker"] is False
+
+    logged = []
+    q._append_log_event = lambda _state, event_type, **payload: logged.append((event_type, payload))
+    assert q._log_session_end_once(state, "keyboard_interrupt", [audio])
+    assert not q._log_session_end_once(state, "keyboard_interrupt", [audio])
+    assert len([event for event in logged if event[0] == "session_end"]) == 1
+
+
+def test_cancelled_capture_clears_runtime_capture_active_state() -> None:
+    q = load_v7_5_module()
+    state = q.RobotRuntimeState(stop_event=threading.Event())
+    state.conversation_manager = q.ConversationManager(q.ConversationConfig(), logger=lambda _line: None)
+
+    class CancelledCapture:
+        def __init__(self, _backend, _manager, stop_event=None):
+            assert stop_event is state.stop_event
+            self.cancelled = True
+            self.last_timing = {}
+
+        def capture(self):
+            state.stop_event.set()
+            return ""
+
+    q.MiguelAudioCapture = CancelledCapture
+    q.prepare_to_listen = lambda _state: True
+    q.set_interaction_state = lambda *_args: None
+    q.notify_face_status = lambda *_args: None
+    q._restore_face_after_audio_capture = lambda _state: None
+
+    assert q.capture_user_turn_when_ready(state) == ""
+    assert state.audio_capture_active is False
+    assert state.audio_capture_blocked_reason == "cancelled"
+
+
+def test_adaptive_endpoint_reason_survives_immutable_turn_event_and_json_log() -> None:
+    q = load_v7_5_module()
+    state = q.RobotRuntimeState(stop_event=threading.Event())
+    manager = q.ConversationManager(q.ConversationConfig(), logger=lambda _line: None)
+    state.conversation_manager = manager
+    manager.begin_listening(1.0)
+    manager.on_voice(True, 1.1)
+    manager.on_partial("what time is it", 1.2)
+    manager.on_voice(False, 1.3)
+    assert manager.evaluate_endpoint(1.81).commit
+
+    turns = q.queue.Queue()
+    q._enqueue_user_turn(turns, state, "what time is it", authorized=True)
+    event = turns.get_nowait()
+    assert event.endpoint_reason == "fast_complete"
+    assert event.latency["turn_commit_reason"] == "fast_complete"
+    assert event.repair_consider is False
+
+    logged = []
+    q._append_log_event = lambda _state, event_type, **payload: logged.append((event_type, payload))
+    with state.lock:
+        state.current_turn_latency = dict(event.latency)
+    q._log_user_turn_event(state, event.text)
+    assert logged[-1][0] == "user_turn"
+    assert logged[-1][1]["endpoint_reason"] == "fast_complete"
+    assert logged[-1][1]["repair_consider"] is False
+
+
 def test_stage1_preserves_timer_router() -> None:
     q = load_v7_5_module()
     spoken = []

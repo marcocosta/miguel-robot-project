@@ -39,6 +39,7 @@ import robot_cloud_brain_v7_full as full
 from miguel_teacher import OpenAICloudTeacherClient, TeacherModeController
 from miguel_conversation_manager import ConversationManager
 from miguel_conversation_events import InteractionState
+from miguel_audio_capture import MiguelAudioCapture
 from miguel_respeaker_xvf3800 import XVF3800Monitor
 from miguel_turn_endpoint import ConversationConfig
 import robot_timer
@@ -295,6 +296,15 @@ class RobotRuntimeState:
     audio_capture_blocked_reason: str | None = None
     last_audio_capture_finished_at: float = 0.0
     last_audio_capture_timing: dict = field(default_factory=dict)
+    audio_capture_attempt_count: int = 0
+    audio_capture_transcript_count: int = 0
+    audio_capture_empty_count: int = 0
+    audio_capture_error_count: int = 0
+    consecutive_audio_capture_errors: int = 0
+    last_capture_exception_type: str | None = None
+    last_capture_exception_message: str | None = None
+    last_capture_error_log_at: float = 0.0
+    audio_worker_started_at: float = 0.0
     reply_queue: queue.Queue | None = None
     user_turn_queue: queue.Queue | None = None
     brain_is_processing: bool = False
@@ -394,11 +404,12 @@ class RobotRuntimeState:
     )
     suppress_next_ready_cue: bool = False
     conversation_log_session_id: str | None = None
+    session_end_logged: bool = False
     conversation_manager: ConversationManager | None = None
     xvf_monitor: XVF3800Monitor | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class UserTurnEvent:
     text: str
     recognized_person: str | None = None
@@ -407,6 +418,8 @@ class UserTurnEvent:
     normalized_text: str = ""
     stripped_text: str = ""
     latency: dict = field(default_factory=dict)
+    endpoint_reason: str = ""
+    repair_consider: bool = False
 
 
 @dataclass
@@ -988,6 +1001,14 @@ def _mark_audio_capture_finished(state: RobotRuntimeState, reason: str) -> None:
         state.audio_capture_active = False
         state.audio_capture_blocked_reason = reason
         state.last_audio_capture_finished_at = now
+        if was_active:
+            state.audio_capture_attempt_count += 1
+            if reason == "transcript":
+                state.audio_capture_transcript_count += 1
+            elif reason == "empty":
+                state.audio_capture_empty_count += 1
+            elif reason == "exception":
+                state.audio_capture_error_count += 1
     if was_active:
         print(f"[V7.14 AUDIO] capture_active=false reason={reason}")
 
@@ -3028,6 +3049,8 @@ def _enqueue_user_turn(
         "log_user_text": str(text or ""),
         "log_person": recognized_person,
     }
+    if manager:
+        turn_latency.update(manager.latency_fields())
     with state.lock:
         turn_latency.update(state.last_audio_capture_timing)
         state.last_audio_capture_timing = {}
@@ -3039,6 +3062,8 @@ def _enqueue_user_turn(
         normalized_text,
         str(stripped_text or ""),
         turn_latency,
+        str(turn_latency.get("turn_commit_reason") or ""),
+        bool(turn_latency.get("repair_consider", False)),
     )
     try:
         user_turn_queue.put_nowait(event)
@@ -3201,6 +3226,30 @@ def _restore_face_after_audio_capture(state: RobotRuntimeState) -> None:
         set_interaction_state(state, _ready_face_state(), "Ready")
 
 
+def _record_audio_capture_exception(state: RobotRuntimeState, exc: Exception) -> None:
+    """Update terminal diagnostics and rate-limit identical capture failure logs."""
+    exc_type = type(exc).__name__
+    exc_message = str(exc)
+    now = time.monotonic()
+    with state.lock:
+        state.consecutive_audio_capture_errors += 1
+        state.last_capture_exception_type = exc_type
+        state.last_capture_exception_message = exc_message
+        should_log = now - state.last_capture_error_log_at >= 10.0
+        if should_log:
+            state.last_capture_error_log_at = now
+        consecutive = state.consecutive_audio_capture_errors
+    if should_log:
+        _append_log_event(
+            state,
+            "capture_error",
+            exception_type=exc_type,
+            exception_message=exc_message,
+            consecutive_capture_errors=consecutive,
+        )
+        print(f"[V7.5 AUDIO] capture_error type={exc_type} message={exc_message}")
+
+
 def capture_user_turn_when_ready(state: RobotRuntimeState) -> str:
     capture_started_at = time.time()
     sleeping = _sleep_mode_active(state)
@@ -3216,19 +3265,22 @@ def capture_user_turn_when_ready(state: RobotRuntimeState) -> str:
         notify_face_status(state, "listening", "YOUR TURN")
     reason = "empty"
     try:
-        user_text = v6.capture_user_turn(conversation_manager=state.conversation_manager)
-        timing = dict(getattr(v6.capture_user_turn, "last_timing", {}) or {})
+        capture = MiguelAudioCapture(v6, state.conversation_manager, stop_event=state.stop_event)
+        user_text = capture.capture()
+        timing = dict(capture.last_timing or {})
         with state.lock:
             state.last_audio_capture_timing = timing
+            state.consecutive_audio_capture_errors = 0
         if user_text and _captured_during_speaking(user_text, state, capture_started_at) and not _is_barge_in_command(user_text):
             _store_interrupted_creative_topic(state, user_text)
             print("[V7.5 AUDIO] Dropped speech captured during Miguel speaking.")
             reason = "captured_during_speaking"
             return ""
-        reason = "transcript" if user_text else "empty"
+        reason = "transcript" if user_text else ("cancelled" if capture.cancelled else "empty")
         return user_text
-    except Exception:
+    except Exception as exc:
         reason = "exception"
+        _record_audio_capture_exception(state, exc)
         raise
     finally:
         _mark_audio_capture_finished(state, reason)
@@ -11139,6 +11191,9 @@ def audio_worker(
     state: RobotRuntimeState,
 ):
     print("[V7.5 AUDIO] AudioWorker started.")
+    with state.lock:
+        state.audio_worker_started_at = time.time()
+    _append_log_event(state, "worker_start", worker="audio")
     last_known_person = None
 
     while not state.stop_event.is_set():
@@ -11488,7 +11543,10 @@ def audio_worker(
 
         except Exception as exc:
             if not state.stop_event.is_set():
-                print("[V7.5 AUDIO] error:", exc)
+                with state.lock:
+                    capture_failed = state.audio_capture_blocked_reason == "exception"
+                if not capture_failed:
+                    print("[V7.5 AUDIO] error:", exc)
                 time.sleep(0.25)
 
     print("[V7.5 AUDIO] AudioWorker stopped.")
@@ -11562,6 +11620,10 @@ def handle_queued_turn(
         with state.lock:
             state.current_turn_latency = dict(event.latency)
             state.current_turn_latency["log_user_text"] = raw_user_text
+            if event.endpoint_reason and not state.current_turn_latency.get("turn_commit_reason"):
+                state.current_turn_latency["turn_commit_reason"] = event.endpoint_reason
+            if event.repair_consider:
+                state.current_turn_latency["repair_consider"] = True
 
     expire_conversation_session_if_needed(state)
     event_authorized = bool(getattr(event, "authorized", False))
@@ -12518,6 +12580,57 @@ def _log_incomplete_turn_on_shutdown(state: RobotRuntimeState, reason: str) -> N
     )
 
 
+def _shutdown_runtime_context(state: RobotRuntimeState, threads: list[threading.Thread]) -> dict:
+    """Return compact terminal diagnostics without exposing secrets or changing control flow."""
+    with state.lock:
+        audio_started_at = float(state.audio_worker_started_at or 0.0)
+        return {
+            "audio": {
+                "worker_started": bool(audio_started_at),
+                "capture_active": bool(state.audio_capture_active),
+                "capture_attempts": int(state.audio_capture_attempt_count),
+                "transcripts": int(state.audio_capture_transcript_count),
+                "empty_captures": int(state.audio_capture_empty_count),
+                "capture_errors": int(state.audio_capture_error_count),
+                "consecutive_capture_errors": int(state.consecutive_audio_capture_errors),
+                "last_capture_result": state.audio_capture_blocked_reason,
+                "last_capture_exception_type": state.last_capture_exception_type,
+                "last_capture_exception_message": state.last_capture_exception_message,
+                "last_capture_finished_at": float(state.last_audio_capture_finished_at or 0.0) or None,
+            },
+            "queues": {
+                "pending_user_turns": int(state.pending_user_turn_count or 0),
+                "pending_replies": int(state.pending_reply_count or 0),
+            },
+            "turn": {
+                "brain_processing": bool(state.brain_is_processing),
+                "speech_active": bool(state.is_speaking),
+            },
+            "workers_alive_after_join": {
+                thread.name: bool(thread.is_alive()) for thread in threads
+            },
+        }
+
+
+def _log_session_end_once(
+    state: RobotRuntimeState,
+    reason: str,
+    threads: list[threading.Thread],
+) -> bool:
+    """Emit at most one terminal event for every graceful stop path."""
+    with state.lock:
+        if state.session_end_logged:
+            return False
+        state.session_end_logged = True
+    _append_log_event(
+        state,
+        "session_end",
+        reason=reason,
+        runtime_context=_shutdown_runtime_context(state, threads),
+    )
+    return True
+
+
 def _launch_debug_handoff() -> bool:
     script_path = THIS_DIR.parent / "tools" / "miguel_debug_last.sh"
     if not script_path.is_file():
@@ -12546,14 +12659,14 @@ def _install_shutdown_signal_handlers(
     if threading.current_thread() is not threading.main_thread():
         return {}
     previous_handlers: dict[int, object] = {}
-    handled_signals = [signal.SIGTERM]
+    handled_signals = [signal.SIGINT, signal.SIGTERM]
     if hasattr(signal, "SIGHUP"):
         handled_signals.append(signal.SIGHUP)
 
     def request_shutdown(signum, _frame) -> None:
         signame = signal.Signals(signum).name.lower()
         print(f"[V7.5] {signame} received; requesting graceful shutdown.")
-        set_termination_reason(signame)
+        set_termination_reason("keyboard_interrupt" if signum == signal.SIGINT else signame)
         stop_event.set()
 
     for sig in handled_signals:
@@ -12748,7 +12861,7 @@ def run_v7_5_queue():
         # Record the terminal turn state only after workers have had a chance
         # to finish or expose the queue/playback stage where shutdown stopped it.
         _log_incomplete_turn_on_shutdown(state, termination_reason)
-        _append_log_event(state, "session_end", reason=termination_reason)
+        _log_session_end_once(state, termination_reason, threads)
         with state.lock:
             debug_handoff_requested = bool(state.debug_handoff_requested)
         if debug_handoff_requested:

@@ -34,8 +34,11 @@ def run(condition: str, device: str, seconds: float, save_wav: str = "") -> dict
             if monitor.available():
                 try:
                     doa, vad = monitor.read_doa_vad()
-                    doa_values.append(doa)
                     vad_values.append(bool(vad))
+                    # A direction observed while firmware VAD is false is not
+                    # valid human-direction evidence.
+                    if vad and doa is not None:
+                        doa_values.append(doa)
                 except Exception as exc:
                     print(f"[AEC_DIAGNOSTIC] sensor_error={type(exc).__name__}: {exc}")
     finally:

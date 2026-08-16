@@ -122,10 +122,26 @@ def score_semantic_completion(partial_text: str, language: str = "en", dialogue_
         "fr": {"peux tu me dire", "pouvez vous me dire", "je me demandais", "et concernant"},
     }
     language_key = language.split("-")[0].lower()
-    if str(partial_text).rstrip().endswith("...") or normalized_text in unfinished_prompts.get(language_key, set()):
+    prompt_phrases = unfinished_prompts.get(language_key, set())
+    has_unfinished_prompt_suffix = any(
+        normalized_text == phrase or normalized_text.endswith(" " + phrase)
+        for phrase in prompt_phrases
+    )
+    if str(partial_text).rstrip().endswith("...") or has_unfinished_prompt_suffix:
         score -= 0.45
         unfinished = True
         reasons.append("unfinished_clause")
+    trailing_subordinate_that = bool(
+        language_key == "en"
+        and re.fullmatch(
+            r"(?:i (?:think|believe|know)|i was thinking|the reason is) that",
+            normalized_text,
+        )
+    )
+    if trailing_subordinate_that:
+        score -= 0.45
+        unfinished = True
+        reasons.append("trailing_subordinate_that")
     if str(partial_text).rstrip().endswith(("?", ".", "!")):
         score += 0.25
         reasons.append("terminal_punctuation")

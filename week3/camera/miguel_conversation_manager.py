@@ -228,8 +228,9 @@ class ConversationManager:
         values = dict(self.turn_timing)
         eot = values.get("turn_commit_monotonic")
         speech = values.get("last_detected_voice_monotonic")
+        if eot is not None and speech is not None:
+            values["speech_to_eot_delay_ms"] = max(0.0, (eot - speech) * 1000)
         for name, stamp in (
-            ("speech_to_eot_delay_ms", speech),
             ("eot_to_final_asr_ms", values.get("final_asr_monotonic")),
             ("eot_to_brain_request_ms", values.get("brain_request_start_monotonic")),
             ("eot_to_response_ready_ms", values.get("brain_response_ready_monotonic")),
