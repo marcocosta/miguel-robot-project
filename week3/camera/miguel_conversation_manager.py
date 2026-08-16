@@ -1,10 +1,12 @@
 """Stage-1 owner of interaction state, engagement, floor and endpointing."""
 
 import re
+import threading
 import time
 from typing import Callable, Optional
 
 from miguel_conversation_events import FloorOwner, InteractionState
+from miguel_spatial_audio import SpatialAudioEvidence, UNKNOWN
 from miguel_turn_endpoint import AdaptiveEndpointDetector, ConversationConfig, EndpointDecision
 
 
@@ -30,6 +32,54 @@ class ConversationManager:
         self._last_candidate_log = 0.0
         self.turn_timing: dict[str, object] = {}
         self._repair_logged = False
+        self._spatial_lock = threading.Lock()
+        self.latest_spatial_audio_evidence = SpatialAudioEvidence(
+            0.0, False, False, None, None, False, 0.0, 0, UNKNOWN
+        )
+        self.turn_spatial_first_stable: Optional[SpatialAudioEvidence] = None
+        self.turn_spatial_last_stable: Optional[SpatialAudioEvidence] = None
+
+    def note_spatial_audio_evidence(self, evidence: SpatialAudioEvidence) -> None:
+        """Store Stage 2B evidence without changing conversation behavior."""
+        with self._spatial_lock:
+            self.latest_spatial_audio_evidence = evidence
+            if (
+                self.state in {InteractionState.LISTENING, InteractionState.END_CANDIDATE}
+                and evidence.available
+                and evidence.vad_active
+                and evidence.stable
+                and not evidence.suppressed
+            ):
+                if self.turn_spatial_first_stable is None:
+                    self.turn_spatial_first_stable = evidence
+                self.turn_spatial_last_stable = evidence
+
+    def spatial_audio_evidence(self) -> SpatialAudioEvidence:
+        with self._spatial_lock:
+            return self.latest_spatial_audio_evidence
+
+    def turn_spatial_audio_evidence(self) -> Optional[SpatialAudioEvidence]:
+        """Return the final stable snapshot latched for this listening turn."""
+        with self._spatial_lock:
+            return self.turn_spatial_last_stable
+
+    def _log_addressee_shadow(self, baseline_accept: bool) -> None:
+        evidence = self.turn_spatial_audio_evidence()
+        evidence_source = "turn_latched"
+        if evidence is None:
+            evidence_source = "no_evidence"
+            evidence = SpatialAudioEvidence(
+                0.0, False, False, None, None, False, 0.0, 0, UNKNOWN
+            )
+        self.log(
+            "[ADDRESSEE_SHADOW] "
+            f"baseline_accept={str(baseline_accept).lower()} "
+            f"evidence_source={evidence_source} "
+            f"vad={str(evidence.vad_active).lower()} raw_doa={evidence.raw_doa_deg} "
+            f"relative_doa={evidence.relative_doa_deg} stable={str(evidence.stable).lower()} "
+            f"resultant={evidence.circular_resultant:.3f} samples={evidence.sample_count} "
+            f"spatial={evidence.classification} suppressed={str(evidence.suppressed).lower()}"
+        )
 
     def _transition(self, target: InteractionState, reason: str) -> None:
         if target == self.state:
@@ -78,6 +128,9 @@ class ConversationManager:
         self.turn_timing = {"capture_start_monotonic": now}
         self._candidate_logged = False
         self._repair_logged = False
+        with self._spatial_lock:
+            self.turn_spatial_first_stable = None
+            self.turn_spatial_last_stable = None
         self._floor(FloorOwner.NONE, "listen_started")
         self._transition(InteractionState.LISTENING, "listen_started")
 
@@ -171,12 +224,16 @@ class ConversationManager:
         now = time.monotonic() if timestamp is None else timestamp
         if explicit_wake:
             self.on_wake(text, timestamp=now)
-            return True
-        if self.expects_reply(now):
+            baseline_accept = True
+        elif self.expects_reply(now):
             if self.expected_reply_person and person:
-                return self.expected_reply_person.casefold() == person.casefold()
-            return True
-        return self.decay_engagement(now) >= self.config.engagement_accept_threshold
+                baseline_accept = self.expected_reply_person.casefold() == person.casefold()
+            else:
+                baseline_accept = True
+        else:
+            baseline_accept = self.decay_engagement(now) >= self.config.engagement_accept_threshold
+        self._log_addressee_shadow(baseline_accept)
+        return baseline_accept
 
     def expects_reply(self, timestamp: Optional[float] = None) -> bool:
         now = time.monotonic() if timestamp is None else timestamp

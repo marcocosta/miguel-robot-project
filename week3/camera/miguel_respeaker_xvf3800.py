@@ -6,6 +6,7 @@ Protocol values are a deliberately small subset of Seeed's upstream
 
 from dataclasses import asdict, dataclass
 import math
+import os
 import struct
 import threading
 import time
@@ -36,19 +37,54 @@ class XVFHealth:
     consecutive_errors: int = 0
     reason: str = "not_probed"
     supported_commands: tuple[str, ...] = ()
+    device_count: int = 0
+    selected_device_index: Optional[int] = None
+    selection_ambiguous: bool = False
+    bus: Optional[int] = None
+    address: Optional[int] = None
+    serial: Optional[str] = None
 
 
 class XVF3800Monitor:
     """Thread-safe, persistent PyUSB control connection; no polling thread."""
 
-    def __init__(self, vid: int = DEFAULT_VID, pid: int = DEFAULT_PID, device: Any = None):
+    def __init__(
+        self,
+        vid: int = DEFAULT_VID,
+        pid: int = DEFAULT_PID,
+        device: Any = None,
+        device_index: Optional[int] = None,
+        serial: Optional[str] = None,
+    ):
         self.vid = vid
         self.pid = pid
         self._device = device
         self._usb_util = None
+        self.device_index = self._env_device_index() if device_index is None else device_index
+        self.serial_selector = (serial if serial is not None else os.getenv("MIGUEL_XVF_SERIAL", "")).strip()
         self._lock = threading.Lock()
         self._health = XVFHealth(vid=vid, pid=pid)
         self._probe()
+
+    @staticmethod
+    def _env_device_index() -> int:
+        try:
+            return max(0, int(os.getenv("MIGUEL_XVF_DEVICE_INDEX", "0")))
+        except ValueError:
+            return 0
+
+    def _safe_serial(self, device: Any) -> Optional[str]:
+        try:
+            value = getattr(device, "serial_number", None)
+            if value:
+                return str(value)
+            index = getattr(device, "iSerialNumber", 0)
+            if index and self._usb_util is not None:
+                value = self._usb_util.get_string(device, index)
+                return str(value) if value else None
+        except Exception:
+            pass
+        return None
 
     def _probe(self) -> None:
         try:
@@ -63,23 +99,53 @@ class XVF3800Monitor:
                 except ImportError:
                     # System libusb remains a supported deployment path.
                     pass
-                self._device = usb.core.find(
+                devices = list(usb.core.find(
+                    find_all=True,
                     idVendor=self.vid,
                     idProduct=self.pid,
                     **find_kwargs,
-                )
-                if self._device is None:
+                ) or ())
+                if not devices:
                     # Some firmware/device variants can carry another PID.
-                    self._device = next(
-                        (candidate for candidate in usb.core.find(find_all=True, **find_kwargs)
-                         if int(getattr(candidate, "idVendor", 0)) == self.vid),
+                    devices = [
+                        candidate for candidate in (usb.core.find(find_all=True, **find_kwargs) or ())
+                        if int(getattr(candidate, "idVendor", 0)) == self.vid
+                    ]
+                devices.sort(key=lambda item: (
+                    int(getattr(item, "bus", -1) or -1),
+                    int(getattr(item, "address", -1) or -1),
+                ))
+                self._health.device_count = len(devices)
+                selected_index = None
+                if self.serial_selector:
+                    selected_index = next(
+                        (index for index, candidate in enumerate(devices)
+                         if self._safe_serial(candidate) == self.serial_selector),
                         None,
                     )
+                    if selected_index is None:
+                        self._health.reason = "serial_not_found"
+                        return
+                elif devices and self.device_index < len(devices):
+                    selected_index = self.device_index
+                elif devices:
+                    self._health.reason = "device_index_out_of_range"
+                    return
+                if selected_index is not None:
+                    self._device = devices[selected_index]
+                    self._health.selected_device_index = selected_index
+                self._health.selection_ambiguous = len(devices) > 1 and not bool(self.serial_selector)
+            else:
+                self._health.device_count = 1
+                self._health.selected_device_index = 0
             if self._device is None:
                 self._health.reason = "device_not_found"
                 return
             self._health.vid = int(getattr(self._device, "idVendor", self.vid))
             self._health.pid = int(getattr(self._device, "idProduct", self.pid))
+            self._health.bus = getattr(self._device, "bus", None)
+            self._health.address = getattr(self._device, "address", None)
+            self._health.serial = self._safe_serial(self._device)
             supported = []
             try:
                 version = self._read("VERSION")
@@ -206,6 +272,10 @@ class XVF3800Monitor:
                 f"vid=0x{health['vid']:04x}\n"
                 f"pid=0x{health['pid']:04x}\n"
                 f"firmware={health['firmware']}\n"
+                f"device_count={health['device_count']}\n"
+                f"selected_device_index={health['selected_device_index']}\n"
+                f"bus={health['bus']} address={health['address']} serial={health['serial'] or 'unavailable'}\n"
+                f"selection_ambiguous={str(health['selection_ambiguous']).lower()}\n"
                 f"vad_supported={str(health['vad_supported']).lower()}\n"
                 f"doa_supported={str(health['doa_supported']).lower()}\n"
                 f"commands={','.join(health['supported_commands']) or 'none'}\n"
@@ -217,6 +287,9 @@ class XVF3800Monitor:
             f"vid=0x{health['vid']:04x}\n"
             f"pid=0x{health['pid']:04x}\n"
             f"firmware={health['firmware']}\n"
+            f"device_count={health['device_count']}\n"
+            f"selected_device_index={health['selected_device_index']}\n"
+            f"selection_ambiguous={str(health['selection_ambiguous']).lower()}\n"
             f"vad_supported={str(health['vad_supported']).lower()}\n"
             f"doa_supported={str(health['doa_supported']).lower()}\n"
             f"reason={health['reason']}\n"

@@ -215,6 +215,68 @@ def test_audio_worker_stops_before_session_end_context_is_collected() -> None:
     assert len([event for event in logged if event[0] == "session_end"]) == 1
 
 
+def test_session_end_includes_stopped_xvf_worker_and_spatial_diagnostics() -> None:
+    q = load_v7_5_module()
+    state = q.RobotRuntimeState(stop_event=threading.Event())
+
+    class SpatialWorker:
+        @staticmethod
+        def diagnostics():
+            return {
+                "available": True,
+                "device_count": 2,
+                "selection_ambiguous": True,
+                "samples": 7,
+                "last_evidence": {"classification": "FRONT_STRONG"},
+            }
+
+    state.xvf_worker = SpatialWorker()
+    xvf_thread = threading.Thread(target=lambda: None, name="XVFWorker")
+    xvf_thread.start()
+    xvf_thread.join()
+    context = q._shutdown_runtime_context(state, [xvf_thread])
+    assert context["workers_alive_after_join"]["XVFWorker"] is False
+    assert context["xvf"]["device_count"] == 2
+    assert context["xvf"]["selection_ambiguous"] is True
+    assert context["xvf"]["last_evidence"]["classification"] == "FRONT_STRONG"
+
+
+def test_user_turn_event_and_json_keep_latched_spatial_snapshot() -> None:
+    q = load_v7_5_module()
+    state = q.RobotRuntimeState(stop_event=threading.Event())
+    manager = q.ConversationManager(q.ConversationConfig(), logger=lambda _line: None)
+    state.conversation_manager = manager
+    q.set_interaction_state = lambda *_args: None
+    manager.begin_listening(1.0)
+    front = q.SpatialAudioEvidence(
+        1.2, True, True, 190, 13, True, 1.0, 7, "FRONT_STRONG"
+    )
+    manager.note_spatial_audio_evidence(front)
+
+    turns = q.queue.Queue()
+    q._enqueue_user_turn(turns, state, "Miguel what time is it")
+    event = turns.get_nowait()
+    assert event.spatial_audio is front
+    assert event.latency["spatial_audio"]["classification"] == "FRONT_STRONG"
+
+    # A subsequent capture clears/replaces the manager latch, not the queued
+    # immutable event or its JSON-ready snapshot.
+    manager.begin_listening(2.0)
+    manager.note_spatial_audio_evidence(
+        q.SpatialAudioEvidence(2.2, True, True, 289, 112, True, 1.0, 5, "OFF_AXIS")
+    )
+    assert event.spatial_audio is front
+    assert event.latency["spatial_audio"]["raw_doa_deg"] == 190
+
+    logged = []
+    state.conversation_log_session_id = "test"
+    q._append_log_event = lambda _state, event_type, **payload: logged.append((event_type, payload))
+    q._log_user_turn_event(state, event.text, route_hint="accepted")
+    user_turn = next(payload for kind, payload in logged if kind == "user_turn")
+    assert user_turn["spatial_audio"]["classification"] == "FRONT_STRONG"
+    assert user_turn["spatial_audio"]["raw_doa_deg"] == 190
+
+
 def test_cancelled_capture_clears_runtime_capture_active_state() -> None:
     q = load_v7_5_module()
     state = q.RobotRuntimeState(stop_event=threading.Event())

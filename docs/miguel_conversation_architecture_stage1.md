@@ -127,3 +127,65 @@ sudo install -m 0644 week3/config/99-miguel-xvf3800.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=usb
 ```
+
+## Stage 2B: shadow spatial-audio evidence
+
+Stage 2B adds an optional, independent `XVFWorker` and
+`miguel_spatial_audio.py`. The worker polls the persistent XVF control monitor
+at 10 Hz by default and retains only VAD-positive DoA samples in a rolling
+0.7-second window. It computes a circular mean and resultant-vector magnitude,
+so directions across the 0/360-degree boundary are handled correctly. At
+least three samples and a resultant of 0.85 are required before direction is
+classified as stable. These calibration values are configurable with
+`MIGUEL_XVF_POLL_HZ`, `MIGUEL_XVF_WINDOW_SECONDS`,
+`MIGUEL_XVF_MIN_STABLE_SAMPLES`, and `MIGUEL_XVF_STABLE_RESULTANT`.
+
+Front calibration defaults to the measured 177 degrees and can be set with
+`MIGUEL_XVF_FRONT_AZIMUTH_DEG`. Relative angle is
+`((raw - front + 180) % 360) - 180`. The current installation therefore
+observes front near 0, physical left near +93, and physical right near -102
+degrees. Sign is not yet mapped to OAK-D camera coordinates. Stable evidence
+within 15 degrees is `FRONT_STRONG`, within 30 degrees is `FRONT_POSSIBLE`,
+and wider angles are `OFF_AXIS`; the gates are configurable.
+
+VAD-false samples are `NO_SPEECH`: their retained firmware DoA is never added
+to the rolling window or treated as a person. While Miguel owns the floor or
+TTS is active, samples are marked `ROBOT_SPEAKING_SUPPRESSED`, the human DoA
+window is cleared, and a modest configurable post-TTS settling guard applies.
+This is required because Stage 2A found Miguel-only VAD at 0.97. The unresolved
+self-speech/AEC failure continues to block automatic barge-in.
+
+`ConversationManager` owns only the latest immutable snapshot. It emits one
+`ADDRESSEE_SHADOW` diagnostic when the existing addressee decision is made,
+but spatial evidence cannot change that decision, engagement, floor ownership,
+endpointing, wake handling, ASR, routing, or TTS. USB/PyUSB failure degrades to
+`UNKNOWN`; PCM capture and conversation continue independently. Sensor/error
+logs and reconnects are rate-limited.
+
+Both identical `2886:001a` devices are enumerated in deterministic bus/address
+order. `MIGUEL_XVF_DEVICE_INDEX` selects an index (default 0), while
+`MIGUEL_XVF_SERIAL` can select a unique serial when one is readable. Startup
+and session-end diagnostics record count, index, bus, address, serial,
+firmware, and whether selection remains ambiguous. The ambiguity is acceptable
+only because this release is shadow mode. Further calibration may refine these
+gates; Stage 3, not Stage 2B, owns future OAK-D/audio spatial fusion. Stage 2C
+remains the separate controlled-barge-in stage and is not implemented here.
+
+The Stage 2B hardware smoke successfully used index 0 at bus 1, address 17,
+serial `114993701262100545`. Because USB address/index can change when two
+identical devices are attached, follow-up calibration should pin this unit with
+`MIGUEL_XVF_SERIAL=114993701262100545`; the serial is an operator setting, not
+a source-code default. Front speech in that smoke appeared around 189--195
+degrees rather than the earlier 177-degree calibration. The default remains
+177 and configurable until several front utterances are measured with the
+pinned device; placement, device orientation, and test geometry are still
+possible explanations.
+
+Instantaneous evidence and turn evidence have separate lifetimes. Every
+`begin_listening()` clears the new turn latch. While LISTENING or END_CANDIDATE,
+the manager retains the first and last stable, VAD-positive, unsuppressed
+snapshots. Later `NO_SPEECH` does not erase them. The final latched snapshot is
+copied into the queued `UserTurnEvent` and user-turn JSON diagnostics, so the
+next capture cannot reattribute evidence asynchronously. Suppressed and
+post-TTS-settling evidence is never eligible for the latch. This remains
+diagnostic-only and cannot change the baseline addressee result.

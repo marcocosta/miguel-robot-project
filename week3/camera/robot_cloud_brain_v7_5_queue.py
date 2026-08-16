@@ -38,9 +38,15 @@ if str(THIS_DIR) not in sys.path:
 import robot_cloud_brain_v7_full as full
 from miguel_teacher import OpenAICloudTeacherClient, TeacherModeController
 from miguel_conversation_manager import ConversationManager
-from miguel_conversation_events import InteractionState
+from miguel_conversation_events import FloorOwner, InteractionState
 from miguel_audio_capture import MiguelAudioCapture
 from miguel_respeaker_xvf3800 import XVF3800Monitor
+from miguel_spatial_audio import (
+    SpatialAudioConfig,
+    SpatialAudioEvidence,
+    SpatialAudioTracker,
+    XVFSpatialWorker,
+)
 from miguel_turn_endpoint import ConversationConfig
 import robot_timer
 
@@ -407,6 +413,8 @@ class RobotRuntimeState:
     session_end_logged: bool = False
     conversation_manager: ConversationManager | None = None
     xvf_monitor: XVF3800Monitor | None = None
+    xvf_tracker: SpatialAudioTracker | None = None
+    xvf_worker: XVFSpatialWorker | None = None
 
 
 @dataclass(frozen=True)
@@ -420,6 +428,7 @@ class UserTurnEvent:
     latency: dict = field(default_factory=dict)
     endpoint_reason: str = ""
     repair_consider: bool = False
+    spatial_audio: SpatialAudioEvidence | None = None
 
 
 @dataclass
@@ -3051,19 +3060,25 @@ def _enqueue_user_turn(
     }
     if manager:
         turn_latency.update(manager.latency_fields())
+    turn_spatial = manager.turn_spatial_audio_evidence() if manager else None
+    if turn_spatial is not None:
+        turn_latency["spatial_audio"] = turn_spatial.as_dict()
+        with state.lock:
+            state.current_turn_latency["spatial_audio"] = turn_spatial.as_dict()
     with state.lock:
         turn_latency.update(state.last_audio_capture_timing)
         state.last_audio_capture_timing = {}
     event = UserTurnEvent(
-        text,
-        recognized_person,
-        bool(authorized),
-        str(authorization_source or ""),
-        normalized_text,
-        str(stripped_text or ""),
-        turn_latency,
-        str(turn_latency.get("turn_commit_reason") or ""),
-        bool(turn_latency.get("repair_consider", False)),
+        text=text,
+        recognized_person=recognized_person,
+        authorized=bool(authorized),
+        authorization_source=str(authorization_source or ""),
+        normalized_text=normalized_text,
+        stripped_text=str(stripped_text or ""),
+        latency=turn_latency,
+        endpoint_reason=str(turn_latency.get("turn_commit_reason") or ""),
+        repair_consider=bool(turn_latency.get("repair_consider", False)),
+        spatial_audio=turn_spatial,
     )
     try:
         user_turn_queue.put_nowait(event)
@@ -4265,6 +4280,7 @@ def _log_user_turn_event(state: RobotRuntimeState, user_text: str, route_hint: s
         monotonic_timing=monotonic_timing,
         endpoint_reason=str(latency.get("turn_commit_reason") or ""),
         repair_consider=bool(latency.get("repair_consider", False)),
+        spatial_audio=dict(latency.get("spatial_audio") or {}),
     )
 
 
@@ -12584,7 +12600,7 @@ def _shutdown_runtime_context(state: RobotRuntimeState, threads: list[threading.
     """Return compact terminal diagnostics without exposing secrets or changing control flow."""
     with state.lock:
         audio_started_at = float(state.audio_worker_started_at or 0.0)
-        return {
+        context = {
             "audio": {
                 "worker_started": bool(audio_started_at),
                 "capture_active": bool(state.audio_capture_active),
@@ -12610,6 +12626,12 @@ def _shutdown_runtime_context(state: RobotRuntimeState, threads: list[threading.
                 thread.name: bool(thread.is_alive()) for thread in threads
             },
         }
+    if state.xvf_worker is not None:
+        try:
+            context["xvf"] = state.xvf_worker.diagnostics()
+        except Exception as exc:
+            context["xvf"] = {"available": False, "diagnostic_error": f"{type(exc).__name__}: {exc}"}
+    return context
 
 
 def _log_session_end_once(
@@ -12729,6 +12751,26 @@ def run_v7_5_queue():
     if conversation_config.enable_xvf_monitor:
         state.xvf_monitor = XVF3800Monitor()
         print(state.xvf_monitor.startup_log())
+        state.xvf_tracker = SpatialAudioTracker(SpatialAudioConfig.from_env())
+
+        def robot_owns_floor() -> bool:
+            with state.lock:
+                speaking = bool(state.is_speaking)
+            return bool(
+                speaking
+                or (
+                    state.conversation_manager is not None
+                    and state.conversation_manager.floor_owner == FloorOwner.MIGUEL
+                )
+            )
+
+        state.xvf_worker = XVFSpatialWorker(
+            state.xvf_monitor,
+            state.xvf_tracker,
+            state.conversation_manager,
+            stop_event,
+            robot_owns_floor,
+        )
     _initialize_startup_conversation_mode(state)
     state.user_turn_queue = user_turn_queue
     state.reply_queue = reply_queue
@@ -12782,6 +12824,14 @@ def run_v7_5_queue():
                     name="BrainWorker",
                 ),
             ]
+            if state.xvf_worker is not None:
+                threads.append(
+                    threading.Thread(
+                        target=state.xvf_worker.run,
+                        daemon=True,
+                        name="XVFWorker",
+                    )
+                )
 
             for thread in threads:
                 thread.start()
